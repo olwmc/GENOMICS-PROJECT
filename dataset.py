@@ -222,13 +222,14 @@ class GenomicsTripletDataset(Dataset):
                     continue
 
                 chrom_info = {
-                    "features": features, # [N_5kb, 5]
-                    "valid_mask": valid_mask, # [N_5kb]
+                    "features": features, # [N_5kb, 5] 5 epigenomic tracks 
+                    "valid_mask": valid_mask, # [N_5kb] binary mask 
                     "valid_indices": valid_indices, # list of valid 5kb bin indices 
                     "positives": positives, # map: anchor_i --> neigh_i --> score (for positive pairs only)
                     "contacts": contacts, # map: anchor_i --> neigh_i --> score 
                 }
                 self.chrom_data[chrom] = chrom_info
+                # populate anchor_lookup: List[(chr_n, anchor index), (chr_n, anchor_index), ...]
                 for anchor in anchors:
                     self.anchor_lookup.append((chrom, int(anchor)))
 
@@ -239,23 +240,26 @@ class GenomicsTripletDataset(Dataset):
         return len(self.anchor_lookup)
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
+        # for given inx get index of anchor (5kb sequence) and the chr it belongs to 
         chrom, anchor = self.anchor_lookup[idx]
+        # get features, contacts, etc
         info = self.chrom_data[chrom]
-        positives = info["positives"]  # type: ignore[index]
-        neighbors, strengths = positives[anchor]  # type: ignore[index]
+        positives = info["positives"]  
+        neighbors, strengths = positives[anchor]  
         pos_idx = int(self.rng.integers(len(neighbors)))
         pos_bin = int(neighbors[pos_idx])
         pos_strength = float(strengths[pos_idx])
 
+        # randomly find a valid bin whose contact score with the anchor is below the threshold 
         neg_bin = self._sample_negative(info, anchor, neighbors)
-        contacts = info["contacts"]  # type: ignore[index]
+        contacts = info["contacts"]  
         neg_strength = float(contacts.get(anchor, {}).get(neg_bin, 0.0))
 
         anchor_seq = self._fetch_sequence(chrom, anchor)
         pos_seq = self._fetch_sequence(chrom, pos_bin)
         neg_seq = self._fetch_sequence(chrom, neg_bin)
 
-        features = info["features"]  # type: ignore[index]
+        features = info["features"]  
         anchor_feat = torch.tensor(features[anchor], dtype=torch.float32)
         pos_feat = torch.tensor(features[pos_bin], dtype=torch.float32)
         neg_feat = torch.tensor(features[neg_bin], dtype=torch.float32)
@@ -289,9 +293,10 @@ class GenomicsTripletDataset(Dataset):
         return _one_hot_encode(seq)
 
     def _sample_negative(self, info: Dict[str, object], anchor: int, positive_neighbors: np.ndarray) -> int:
-        valid_indices = info["valid_indices"]  # type: ignore[index]
-        contacts = info["contacts"]  # type: ignore[index]
+        valid_indices = info["valid_indices"]  
+        contacts = info["contacts"]  
         positives_set = set(int(x) for x in positive_neighbors.tolist())
+        # sample random indices negative_attempts # of times and see if its a valid negative partner for the given anchor bin
         for _ in range(self.negative_attempts):
             candidate = int(self.rng.choice(valid_indices))
             if candidate == anchor or candidate in positives_set:
@@ -299,6 +304,7 @@ class GenomicsTripletDataset(Dataset):
             if contacts.get(anchor, {}).get(candidate, 0.0) >= self.contact_threshold:
                 continue
             return candidate
+        # Deterministic safety net: if our random guesses above fail we just work through all possible valid_indices 
         for candidate in valid_indices:
             candidate = int(candidate)
             if candidate == anchor or candidate in positives_set:
