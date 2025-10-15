@@ -22,10 +22,17 @@ def main():
     shape = dset.shape
     print("epiphany shape: ", shape[1]*100)
     print("hic: ", 49850*5000)
-    fa = Fasta("data/hg38/hg38.fa", as_raw=True)  # will build hg38.fa.fai index automatically
+    fa = Fasta("data/hg38/hg38.fa", as_raw=True)  
     for chrom in fa.keys():
-        print(chrom, len(fa[chrom]))
-        break 
+        chrom_len = len(fa[chrom])
+        print(chrom, chrom_len)
+        if chrom == "chr1":
+            first_100 = fa[chrom][:100]
+            last_100 = fa[chrom][chrom_len - 100 : chrom_len]
+            print("chr1 first 100 bases:", first_100)
+            print("chr1 last 100 bases:", last_100)
+        break
+
 
 if __name__ == "__main__":
     main()
