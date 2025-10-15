@@ -1,0 +1,13 @@
+GM12878_X.h5 (Epiphany 5 Epigenomic Tracks)
+	- One dataset per chromosome ('chr1' ... 'chr22').
+	- Each dataset has shape (5, N) → 5 epigenomic tracks × N 100 bp bins along the chromosome.
+
+Hi-C (Rao, GEO)
+    - GM12878 cell type 
+    - chr1, chr2, chr3
+        - ...
+        - chr1_5kb.KRexpected (list of normalised values for each 5kb bin in the given chr)
+
+Sequence data (ENCODE)
+- FASTA file 
+	
