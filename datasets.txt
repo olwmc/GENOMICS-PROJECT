@@ -1,13 +1,17 @@
+https://zenodo.org/records/7795868
 GM12878_X.h5 (Epiphany 5 Epigenomic Tracks)
 	- One dataset per chromosome ('chr1' ... 'chr22').
 	- Each dataset has shape (5, N) → 5 epigenomic tracks × N 100 bp bins along the chromosome.
 
+wget -c ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE63nnn/GSE63525/suppl/GSE63525_GM12878_primary_intrachromosomal_contact_matrices.tar.gz
 Hi-C (Rao, GEO)
     - GM12878 cell type 
     - chr1, chr2, chr3
         - ...
         - chr1_5kb.KRexpected (list of normalised values for each 5kb bin in the given chr)
 
-Sequence data (ENCODE)
+wget http://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz
+gunzip hg38.fa.gz
+Sequence data (UCSC)
 - FASTA file 
 	
