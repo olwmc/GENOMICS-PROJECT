@@ -341,7 +341,6 @@ class GenomicsTripletDataset(Dataset):
             "anchor_index": anchor,
             "pos_index": pos_bin,
             "neg_index": neg_bin,
-            "contact_strength": pos_strength,
             "pos_contact_strength": pos_strength,
             "neg_contact_strength": neg_strength,
         }
