@@ -4,7 +4,7 @@
 
 #SBATCH --gres=gpu:1
 
-#SBATCH --mem=16G
+#SBATCH --mem=64G
 
 #SBATCH --time=24:00:00
 
@@ -18,5 +18,11 @@ module load python/3.11
 
 source ~/genomics_env/bin/activate
 
-python dataset.py 
+python dataset.py \
+    --mode pair --hic-norm KR --oe-metric oe \
+    --chroms chr1 \
+    --bin-edges 25000,100000,400000,1000000,10000000 \
+    --pos-quantile 0.8 --neg-quantile 0.2 --num-negatives 8 \
+    --min-distance-bp 25000 --pairs-per-batch 16 \
+    --patch-size-bp 100 --token-mode thin --emit-pos-ids
   
