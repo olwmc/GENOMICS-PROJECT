@@ -22,7 +22,7 @@ python dataset.py \
     --mode pair --hic-norm KR --oe-metric oe \
     --chroms chr1 \
     --bin-edges 25000,100000,400000,1000000,10000000 \
-    --pos-quantile 0.8 --neg-quantile 0.2 --num-negatives 8 \
-    --min-distance-bp 25000 --pairs-per-batch 16 \
+    --pos-quantile 0.7 --neg-quantile 0.3 --num-negatives 8 \
+    --min-distance-bp 25000 --pairs-per-batch 32 \
     --patch-size-bp 100 --token-mode thin --emit-pos-ids
   

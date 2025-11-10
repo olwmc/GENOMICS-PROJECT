@@ -15,6 +15,9 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 BIN_SIZE = 5000
 EPIPHANY_BIN_SIZE = 100
+SEQ_DTYPE = torch.float16  # change to float32 if you prefer exact previous dtype
+EPI_DTYPE = torch.float16  # change to float32 to match old behavior exactly
+PRECOMPUTE_SEQ = True      # set False if RAM is tight
 
 if BIN_SIZE % EPIPHANY_BIN_SIZE != 0:
     raise ValueError("BIN_SIZE must be a multiple of EPIPHANY_BIN_SIZE")
@@ -279,6 +282,16 @@ class GenomicsContrastiveDataset(Dataset):
         self.bin_anchor_lookup: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
         self.bin_neighbors: Dict[int, List[int]] = {}
 
+        # precomputed tensors per chromosome (filled in _prepare_chromosome)
+        # Each entry shape by chrom:
+        #   seq_tokens_all: (num_bins, tokens_per_locus, 4, patch_size_bp)
+        #   epi_tokens_all (thin): (num_bins, tokens_per_locus, epi_channels)
+        #   epi_tokens_all (rich): (num_bins, tokens_per_locus, epi_channels, epiphany_bin_size)
+        self.seq_tokens_all: Dict[str, torch.Tensor] = {}
+        self.epi_tokens_all: Dict[str, torch.Tensor] = {}
+        # Optional cached negative sampling distributions for hard-negative
+        self._neg_probs: Dict[Tuple[str, int, int], np.ndarray] = {}
+
         resolution_dir = self.hic_root / f"{self.bin_size // 1000}kb_resolution_intrachromosomal"
 
         with h5py.File(self.epiphany_path, "r") as h5:
@@ -483,6 +496,55 @@ class GenomicsContrastiveDataset(Dataset):
         norms[norms == 0.0] = 1.0
         features_norm /= norms
 
+        # --- PRECOMPUTE TOKENS PER BIN (sequence + epigenomic) ---
+        num_bins = int(valid_mask.shape[0])
+
+        # Precompute sequence tokens (optional to save RAM)
+        if PRECOMPUTE_SEQ:
+            seq_tokens_list = []
+            fasta = self._get_fasta()
+            for b in range(num_bins):
+                if not valid_mask[b]:
+                    # fill with zeros to keep indexing consistent
+                    seq_tokens_list.append(torch.zeros(self.tokens_per_locus, 4, self.patch_size_bp, dtype=SEQ_DTYPE))
+                    continue
+                start = b * self.bin_size
+                end = start + self.bin_size
+                seq = str(fasta[chrom][start:end])
+                if len(seq) < self.bin_size:
+                    seq = seq + "N" * (self.bin_size - len(seq))
+                elif len(seq) > self.bin_size:
+                    seq = seq[: self.bin_size]
+                onehot = _one_hot_encode(seq).to(dtype=SEQ_DTYPE)  # (4, 5000)
+                tok = onehot.view(4, self.tokens_per_locus, self.patch_size_bp).permute(1, 0, 2).contiguous()
+                seq_tokens_list.append(tok)
+            seq_tokens_all = torch.stack(seq_tokens_list, dim=0)  # (num_bins, T, 4, P)
+            self.seq_tokens_all[chrom] = seq_tokens_all
+        else:
+            # we’ll fetch sequence on demand (old path)
+            self.seq_tokens_all[chrom] = torch.empty(0)  # sentinel
+
+        # Precompute epigenomic tokens
+        epi = epiphany_raw  # (C, num_bins * epi_windows_per_bin)
+        T = self.tokens_per_locus
+        W = self.windows_per_token
+        C = epi.shape[0]
+        epi_tokens_list = []
+        for b in range(num_bins):
+            start = b * self.epi_windows_per_bin
+            end = start + self.epi_windows_per_bin
+            win = epi[:, start:end].reshape(C, T, W)
+            if self.token_mode == "thin":
+                pooled = win.mean(axis=2, dtype=np.float32).transpose(1, 0)  # (T, C)
+                epi_tokens_list.append(torch.from_numpy(pooled.astype(np.float32, copy=False)).to(dtype=EPI_DTYPE))
+            else:
+                # "rich" expands each 100bp window by epiphany_bin_size (100), matching your prior code
+                expanded = np.repeat(win, repeats=self.epiphany_bin_size, axis=2)  # (C, T, W*100)
+                expanded = expanded.transpose(1, 0, 2)  # (T, C, W*100)
+                epi_tokens_list.append(torch.from_numpy(expanded.astype(np.float32, copy=False)).to(dtype=EPI_DTYPE))
+        epi_tokens_all = torch.stack(epi_tokens_list, dim=0)  # (num_bins, T, C) or (num_bins, T, C, 100)
+        self.epi_tokens_all[chrom] = epi_tokens_all
+
         return {
             "features": features_mean.astype(np.float32, copy=False),
             "features_norm": features_norm.astype(np.float32, copy=False),
@@ -613,6 +675,26 @@ class GenomicsContrastiveDataset(Dataset):
         for bin_id in self.bin_to_indices:
             others = sorted(self.bin_to_indices.keys(), key=lambda x: (abs(x - bin_id), x))
             self.bin_neighbors[bin_id] = [b for b in others if b != bin_id]
+        
+        # Precompute hard-negative sampling distributions
+        if self.hard_negative:
+            self._neg_probs.clear()
+            for key, neg_entry in self.neg_pool.items():
+                chrom, anchor, bin_id = key
+                if neg_entry["partners"].size == 0:
+                    continue
+                # cosine-sim weights using features_norm
+                chrom_info = self.chrom_data[chrom]
+                anchor_vec = chrom_info["features_norm"][anchor]  # (C_feat,)
+                candidates = chrom_info["features_norm"][neg_entry["partners"]]  # (N, C_feat)
+                sims = candidates @ anchor_vec
+                sims_min = float(sims.min(initial=0.0))
+                weights = sims - sims_min
+                weights = np.asarray(weights, dtype=np.float64) + 1e-6
+                total = float(weights.sum())
+                if total > 0.0:
+                    probs = weights / total
+                    self._neg_probs[key] = probs
 
     def __len__(self) -> int:
         return len(self.sample_entries)
@@ -673,16 +755,7 @@ class GenomicsContrastiveDataset(Dataset):
         replace = neg_entry["partners"].size < neg_needed
         probs = None
         if self.hard_negative:
-            chrom_info = self.chrom_data[chrom]
-            anchor_vec = chrom_info["features_norm"][anchor]
-            candidates = chrom_info["features_norm"][neg_entry["partners"]]
-            sims = candidates @ anchor_vec
-            sims_min = float(sims.min(initial=0.0))
-            weights = sims - sims_min
-            weights += 1e-6
-            total = float(weights.sum())
-            if total > 0:
-                probs = weights / total
+            probs = self._neg_probs.get(pos_key)
 
         neg_choices = self.rng.choice(
             neg_entry["partners"].size,
@@ -772,24 +845,16 @@ class GenomicsContrastiveDataset(Dataset):
         return _one_hot_encode(seq)
 
     def _sequence_tokens(self, chrom: str, bin_index: int) -> torch.FloatTensor:
+        pre = self.seq_tokens_all.get(chrom)
+        if pre is not None and pre.numel() > 0:
+            return pre[bin_index].contiguous()
+        # fallback (PRECOMPUTE_SEQ=False): old path
         seq = self._fetch_sequence(chrom, bin_index)
         seq = seq[:, : self.bin_size]
-        seq = seq.contiguous().view(4, self.tokens_per_locus, self.patch_size_bp).permute(1, 0, 2).contiguous()
-        return seq.to(dtype=torch.float32)
+        return seq.view(4, self.tokens_per_locus, self.patch_size_bp).permute(1, 0, 2).contiguous().to(dtype=SEQ_DTYPE)
 
     def _epigenomic_tokens(self, chrom: str, bin_index: int) -> torch.FloatTensor:
-        chrom_info = self.chrom_data[chrom]
-        epi = chrom_info["epiphany_raw"]
-        start = bin_index * self.epi_windows_per_bin
-        end = start + self.epi_windows_per_bin
-        window_slice = epi[:, start:end]
-        window_slice = window_slice.reshape(epi.shape[0], self.tokens_per_locus, self.windows_per_token)
-        if self.token_mode == "thin":
-            pooled = window_slice.mean(axis=2, dtype=np.float32).transpose(1, 0)
-            return torch.from_numpy(pooled.astype(np.float32, copy=False))
-        expanded = np.repeat(window_slice, repeats=self.epiphany_bin_size, axis=2)
-        expanded = expanded.transpose(1, 0, 2)
-        return torch.from_numpy(expanded.astype(np.float32, copy=False))
+        return self.epi_tokens_all[chrom][bin_index].contiguous()
 
     def close(self) -> None:
         if self._fa is not None:
@@ -978,9 +1043,9 @@ def _print_batch_stats(batch: Dict[str, object], dataset: GenomicsContrastiveDat
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Genomics contrastive dataset demo")
-    parser.add_argument("--fasta", default='data/hg38/hg38.fa', help="Path to FASTA file")
-    parser.add_argument("--epiphany", default='data/epiphany/GM12878_X.h5', help="Path to Epiphany HDF5 file")
-    parser.add_argument("--hic-root", default='data/hic/GM12878_primary', help="Root directory for Hi-C contacts")
+    parser.add_argument("--fasta", default='/users/jrober48/data/jroberts/2952-G/data/hg38/hg38.fa', help="Path to FASTA file")
+    parser.add_argument("--epiphany", default='/users/jrober48/data/jroberts/2952-G/data/epiphany/GM12878_X.h5', help="Path to Epiphany HDF5 file")
+    parser.add_argument("--hic-root", default='/users/jrober48/data/jroberts/2952-G/data/hic/GM12878_primary', help="Root directory for Hi-C contacts")
     parser.add_argument("--chroms", nargs="*", default=None, help="Subset of chromosomes to load")
 
     parser.add_argument("--mode", choices=["pair", "triplet"], default="pair")
@@ -1038,6 +1103,32 @@ def main() -> None:
 
     if len(dataset) == 0:
         raise RuntimeError("Dataset contains no samples with current configuration")
+
+    # anchors with pos>0 per (chrom, bin)
+    total_counts = defaultdict(int)
+    # anchors with pos>0 but neg==0 per (chrom, bin)
+    empty_counts = defaultdict(int)
+    # anchors with pos>0 and neg>0 (usable)
+    usable_counts = defaultdict(int)
+
+    for (chrom, anchor, bin_id), pos_entry in dataset.pos_pool.items():
+        if pos_entry["partners"].size == 0:
+            continue  # only anchors that truly have positives
+        total_counts[(chrom, bin_id)] += 1
+        neg_entry = dataset.neg_pool.get((chrom, anchor, bin_id), {"partners": np.array([], dtype=np.int64)})
+        if neg_entry["partners"].size == 0:
+            empty_counts[(chrom, bin_id)] += 1
+        else:
+            usable_counts[(chrom, bin_id)] += 1
+
+    for (chrom, bin_id) in sorted(total_counts.keys()):
+        total = total_counts[(chrom, bin_id)]
+        empty = empty_counts.get((chrom, bin_id), 0)
+        usable = usable_counts.get((chrom, bin_id), 0)
+        pct_empty = 100 * empty / total if total else 0.0
+        low, high = dataset.get_bin_range(bin_id)
+        print(f"{chrom} bin {bin_id} ({low:,}–{high or 'inf'} bp): "
+            f"empty_neg={empty}/{total} ({pct_empty:.1f}%), usable={usable}")
 
     if args.mode == "pair":
         sampler = DistanceBinBatchSampler(
