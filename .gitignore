@@ -3,3 +3,5 @@ out/
 errors/
 # dataset.py
 __pycache__/
+audit.json
+suspects.csv

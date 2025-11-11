@@ -129,6 +129,7 @@ def _load_contacts(
                 continue
             if i >= max_bins or j >= max_bins:
                 continue
+            # if we have a normalisation method specified
             if norm_values is not None:
                 if i >= norm_length or j >= norm_length:
                     continue
@@ -138,6 +139,7 @@ def _load_contacts(
                     continue
                 if norm_i <= 0.0 or norm_j <= 0.0:
                     continue
+                # normalise the contact values
                 value = value / (norm_i * norm_j)
             current = contacts[i].get(j)
             if current is None or value > current:
@@ -526,19 +528,21 @@ class GenomicsContrastiveDataset(Dataset):
 
         # Precompute epigenomic tokens
         epi = epiphany_raw  # (C, num_bins * epi_windows_per_bin)
-        T = self.tokens_per_locus
-        W = self.windows_per_token
-        C = epi.shape[0]
+        T = self.tokens_per_locus # 50 100bp tokens per locus/bin
+        W = self.windows_per_token # 1 if patch_size_bp = 100
+        C = epi.shape[0] # num epigenomic tracks (5)
         epi_tokens_list = []
         for b in range(num_bins):
+            # establish window for given bin 
             start = b * self.epi_windows_per_bin
             end = start + self.epi_windows_per_bin
             win = epi[:, start:end].reshape(C, T, W)
-            if self.token_mode == "thin":
+            if self.token_mode == "thin": # single epiphany value per window
+                # average 100bp epiphany signals to get a single value per 5kb
                 pooled = win.mean(axis=2, dtype=np.float32).transpose(1, 0)  # (T, C)
                 epi_tokens_list.append(torch.from_numpy(pooled.astype(np.float32, copy=False)).to(dtype=EPI_DTYPE))
             else:
-                # "rich" expands each 100bp window by epiphany_bin_size (100), matching your prior code
+                # "rich" consider each 100bp epiphany value
                 expanded = np.repeat(win, repeats=self.epiphany_bin_size, axis=2)  # (C, T, W*100)
                 expanded = expanded.transpose(1, 0, 2)  # (T, C, W*100)
                 epi_tokens_list.append(torch.from_numpy(expanded.astype(np.float32, copy=False)).to(dtype=EPI_DTYPE))
@@ -677,7 +681,7 @@ class GenomicsContrastiveDataset(Dataset):
             self.bin_neighbors[bin_id] = [b for b in others if b != bin_id]
         
         # Precompute hard-negative sampling distributions
-        if self.hard_negative:
+        if self.hard_negative: # weight "hard" negatives higher when sampling for negative pairs --> "hard" meaning high cosine similarity between positive pair --> forces model to be good instead of just comparing a really good pair against a really bad pair
             self._neg_probs.clear()
             for key, neg_entry in self.neg_pool.items():
                 chrom, anchor, bin_id = key
