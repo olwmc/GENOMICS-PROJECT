@@ -134,6 +134,11 @@ class DNATokenizer:
             'C': 2,
             'G': 3,
             'T': 4,
+
+            'a': 1,
+            'c': 2,
+            't': 3,
+            'g': 4,
         }
         self.inverse_vocab = {v: k for k, v in self.vocab.items()}
         self.vocab_size = len(self.vocab)
@@ -211,7 +216,7 @@ class DNAAutoencoder(nn.Module):
         
         # Apply learned pooling projection
         x = self.pool_proj(x)
-        
+
         return x, seq_len
     
     def upsample(self, x, target_len):
@@ -284,19 +289,24 @@ class DNADataset(Dataset):
         self.sequences = []
         
         print(f"Loading sequences from {fasta_file}...")
+
         
+        valid = [f'chr{i}' for i in range(0,20)]
         # Load sequences from FASTA file
         try:
             for i, record in enumerate(SeqIO.parse(fasta_file, "fasta")):
+                if record.id not in valid:
+                    break
+
                 seq = str(record.seq)
                 
                 # Split long sequences into chunks
                 for j in range(0, len(seq) - seq_len + 1, seq_len // 2):
                     chunk = seq[j:j + seq_len]
                     if len(chunk) == seq_len:
-                        self.sequences.append(chunk)
-                        if len(self.sequences) >= max_sequences:
-                            break
+                        # Make sure it's not just all NNNNN
+                        if len(set(chunk)) >= 2:
+                            self.sequences.append(chunk)
                 
                 if (i + 1) % 100 == 0:
                     print(f"Processed {i + 1} sequences...")
@@ -310,6 +320,12 @@ class DNADataset(Dataset):
                 seq = ''.join(random.choices(nucleotides, k=seq_len))
                 self.sequences.append(seq)
 
+
+        random.shuffle(self.sequences)
+        self.test_sequences = self.sequences[max_sequences: max_sequences + 100]
+        assert(len(self.test_sequences) >= 100)
+
+        self.sequences = self.sequences[:max_sequences]
         print(f"Loaded {len(self.sequences)} sequences of length {seq_len}")
     
     def __len__(self):
@@ -368,24 +384,24 @@ def train_autoencoder(
 def main():
     # Configuration
     FASTA_FILE = "/oscar/scratch/omclaugh/hg38.fa"
-    SEQ_LEN = 512
+    SEQ_LEN = 100
     BATCH_SIZE = 32
-    EPOCHS = 10
+    EPOCHS = 15
     
     # Create dataset and dataloader
-    dataset = DNADataset(FASTA_FILE, seq_len=SEQ_LEN, max_sequences=100)
+    dataset = DNADataset(FASTA_FILE, seq_len=SEQ_LEN, max_sequences=100_000)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     
     # Create model
     model = DNAAutoencoder(
         vocab_size=5,
-        d_model=128,
+        d_model=32,
         n_heads=4,
-        n_encoder_layers=1,  # Shallow encoder
-        n_decoder_layers=1,  # Deeper decoder
-        d_ff=256,
+        n_encoder_layers=2,  # Shallow encoder
+        n_decoder_layers=2,  # Deeper decoder
+        d_ff=128,
         max_seq_len=SEQ_LEN,
-        pool_size=1,
+        pool_size=100,
         dropout=0.1,
         max_relative_position=32
     )
@@ -406,19 +422,21 @@ def main():
     
     with torch.no_grad():
         # Get a sample sequence
-        sample = dataset[0].unsqueeze(0).to(device)
+        sample = torch.Tensor([tokenizer.encode(seq) for seq in dataset.test_sequences]).long().to(device)#.to(device)#[-1].unsqueeze(0).to(device)
+        print(sample.shape)
         
         # Reconstruct
         logits = model(sample)
+
+        # Print out the middle shape
+        middle, _ = model.encode(sample)
+        print("Middle shape:", middle.shape)
+
         predictions = torch.argmax(logits, dim=-1)
         
         # Decode
-        original = tokenizer.decode(sample[0].cpu().numpy())
-        reconstructed = tokenizer.decode(predictions[0].cpu().numpy())
-        
-        print("\nSample Reconstruction:")
-        print(f"Original:      {original[:50]}...")
-        print(f"Reconstructed: {reconstructed[:50]}...")
+        original = [tokenizer.decode(s) for s in sample.cpu().numpy()]
+        reconstructed = [tokenizer.decode(s) for s in predictions.cpu().numpy()]
         
         # Calculate accuracy
         accuracy = (sample == predictions).float().mean().item()
