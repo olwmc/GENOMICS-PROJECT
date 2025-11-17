@@ -283,7 +283,7 @@ class DNAAutoencoder(nn.Module):
 
 class DNADataset(Dataset):
     """Dataset for DNA sequences from FASTA file"""
-    def __init__(self, fasta_file, seq_len=512, max_sequences=10000):
+    def __init__(self, fasta_file, seq_len=512, max_sequences=10_000):
         self.seq_len = seq_len
         self.tokenizer = DNATokenizer()
         self.sequences = []
@@ -322,7 +322,7 @@ class DNADataset(Dataset):
 
 
         random.shuffle(self.sequences)
-        self.test_sequences = self.sequences[max_sequences: max_sequences + 100]
+        self.test_sequences = self.sequences[max_sequences: max_sequences + 1_000]
         assert(len(self.test_sequences) >= 100)
 
         self.sequences = self.sequences[:max_sequences]
@@ -385,26 +385,28 @@ def main():
     # Configuration
     FASTA_FILE = "/oscar/scratch/omclaugh/hg38.fa"
     SEQ_LEN = 100
-    BATCH_SIZE = 32
-    EPOCHS = 15
+    BATCH_SIZE = 64
+    EPOCHS = 25
     
     # Create dataset and dataloader
-    dataset = DNADataset(FASTA_FILE, seq_len=SEQ_LEN, max_sequences=100_000)
+    dataset = DNADataset(FASTA_FILE, seq_len=SEQ_LEN, max_sequences=1_000_000)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     
     # Create model
     model = DNAAutoencoder(
         vocab_size=5,
         d_model=32,
-        n_heads=4,
+        n_heads=8,
         n_encoder_layers=2,  # Shallow encoder
-        n_decoder_layers=2,  # Deeper decoder
-        d_ff=128,
+        n_decoder_layers=3,  # Deeper decoder
+        d_ff=256,
         max_seq_len=SEQ_LEN,
         pool_size=100,
         dropout=0.1,
         max_relative_position=32
     )
+
+    print(model)
     
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
     
