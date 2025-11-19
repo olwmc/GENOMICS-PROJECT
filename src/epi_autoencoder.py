@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import math
 import random
 from tqdm import tqdm
-from autoencoders import EpigenomicAutoencoder
+from src.autoencoders import EpigenomicAutoencoder
 
 class EpigenomicDataset(Dataset):
     """Dataset for epigenomic tracks from h5 file, aligned with DNA sequences"""
@@ -19,7 +19,6 @@ class EpigenomicDataset(Dataset):
         
         if chromosomes is None:
             chromosomes = [f'chr{i}' for i in range(1, 20)]
-        
                 
         # Replace the entire data loading section in __init__:
         
