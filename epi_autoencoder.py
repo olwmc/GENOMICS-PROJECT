@@ -138,11 +138,10 @@ def train_autoencoder(
     
     return model
 
-
 def main():
     # Configuration
     H5_FILE = "/oscar/scratch/omclaugh/GM12878_X.h5"  # Update this path
-    SEQ_LEN = 100  # Number of consecutive 100bp bins
+    SEQ_LEN = 100 # 100bp segments
     BATCH_SIZE = 64
     EPOCHS = 25
     MAX_SEQUENCES = 300_000
