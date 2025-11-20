@@ -71,17 +71,20 @@ class ContrastiveModel(nn.Module):
         Encode DNA sequence with epigenomic features.
         
         Args:
-            dna: [B, 50, 100] DNA sequences at 100bp resolution (5kb total)
+            dna: [B, 50, 100, 5] DNA sequences at 100bp resolution (5kb total)
             epi: [B, 50, 5] Epigenomic tracks at 100bp resolution
             
         Returns:
             [B, d_embed] Normalized embeddings
         """
+        B = dna.shape[0]
         # Encode DNA
-        dna_embeds = self.dna_autoencoder.encode(dna)  # [B, 50, d_bottleneck]
+        dna_embeds, _ = self.dna_autoencoder.encode(dna.reshape(B*50, -1))  # [B, 50, d_bottleneck]
+
+        dna_embeds = dna_embeds.squeeze().reshape(B, 50, -1)
         
         # Concatenate with epigenomic features
-        encoding = torch.cat([dna_embeds, epi], dim=-1)  # [B, 50, d_bottleneck+5]
+        encoding = torch.cat((dna_embeds.squeeze(), epi), dim=-1)  # [B, 50, d_bottleneck+5]
         
         # Aggregate to single embedding
         aggregated = self._aggregate(encoding)  # [B, d_embed]
@@ -108,4 +111,17 @@ if __name__ == "__main__":
     ae.load_state_dict(weights)
 
     model = ContrastiveModel(ae)
+    for p in model.parameters():
+        p.requires_grad = False
+
+    model.cuda()
+
     print("Model was instantiated!")
+
+    # Test input
+    B=32*10
+
+    dna_ex = torch.randint(0, 5, (B, 50, 100)).cuda()
+    epi_ex = torch.randn(B, 50, 5).cuda()
+
+    print(model(dna_ex, epi_ex).shape)
