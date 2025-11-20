@@ -8,6 +8,7 @@ import math
 from Bio import SeqIO
 import random
 from tqdm import tqdm
+from .autoencoders import SequenceAutoencoder
 
 class DNATokenizer:
     """Simple DNA tokenizer for ACGT nucleotides"""
@@ -93,7 +94,7 @@ def train_autoencoder(
     model,
     dataloader,
     epochs=1,
-    lr=1e-4,
+    lr=3e-4,
     device='cuda' if torch.cuda.is_available() else 'cpu'
 ):
     """Train the DNA autoencoder"""
@@ -139,26 +140,17 @@ def main():
     SEQ_LEN = 100
     BATCH_SIZE = 64
     EPOCHS = 25
-    
+    OUTPUT_DIR = "/users/omclaugh/owm/GENOMICS-PROJECT/trained_models/"
+
+    model = SequenceAutoencoder(
+        input_channels=5,      # vocab_size
+        is_dna=True,
+        pool_size=100
+    )
+
     # Create dataset and dataloader
     dataset = DNADataset(FASTA_FILE, seq_len=SEQ_LEN, max_sequences=1_000_000)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    
-    # Create model
-    model = DNAAutoencoder(
-        vocab_size=5,
-        d_model=32,
-        n_heads=8,
-        n_encoder_layers=2,  # Shallow encoder
-        n_decoder_layers=3,  # Deeper decoder
-        d_ff=256,
-        max_seq_len=SEQ_LEN,
-        pool_size=100,
-        dropout=0.1,
-        max_relative_position=32
-    )
-
-    print(model)
     
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
     
@@ -166,7 +158,7 @@ def main():
     trained_model = train_autoencoder(model, dataloader, epochs=EPOCHS)
     
     # Save model
-    torch.save(trained_model.state_dict(), 'dna_autoencoder.pth')
+    torch.save(trained_model.state_dict(), OUTPUT_DIR+'dna_autoencoder.pth')
     print("Model saved to dna_autoencoder.pth")
     
     # Test reconstruction

@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import math
 import random
 from tqdm import tqdm
-from src.autoencoders import EpigenomicAutoencoder
+from .autoencoders import SequenceAutoencoder
 
 class EpigenomicDataset(Dataset):
     """Dataset for epigenomic tracks from h5 file, aligned with DNA sequences"""
@@ -156,21 +156,12 @@ def main():
     )
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     
-    # Create model with same architecture as DNA autoencoder
-    model = EpigenomicAutoencoder(
-        n_tracks=5,
-        d_model=24,
-        n_heads=8,
-        n_encoder_layers=2,
-        n_decoder_layers=3,
-        d_ff=256,
-        max_seq_len=SEQ_LEN,
-        pool_size=100,  # Compress 100 bins -> 1 vector
-        dropout=0.1,
-        max_relative_position=32
+    model = SequenceAutoencoder(
+        input_channels=5,      # vocab_size
+        is_dna=False,
+        pool_size=100
     )
-    
-    print(model)
+
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
     
     # Normalize test sequences
@@ -227,7 +218,6 @@ def main():
             output_track = output_np[:, :, track_idx].flatten()
             corr = np.corrcoef(sample_track, output_track)[0, 1]
             print(f"  Track {track_idx}: {corr:.4f}")
-
 
 if __name__ == "__main__":
     main()
