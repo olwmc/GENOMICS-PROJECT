@@ -1,6 +1,6 @@
 # Contrastive model for genomic sequences with epigenomic features
 
-from autoencoders.autoencoders import SequenceAutoencoder
+from src.autoencoders.autoencoders import SequenceAutoencoder
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
@@ -98,4 +98,14 @@ class ContrastiveModel(nn.Module):
     
 
 if __name__ == "__main__":
-    
+    ae = SequenceAutoencoder(
+        input_channels=5,      # vocab_size
+        is_dna=True,
+        pool_size=100
+    )
+
+    weights = torch.load("trained_models/dna_autoencoder.pth")
+    ae.load_state_dict(weights)
+
+    model = ContrastiveModel(ae)
+    print("Model was instantiated!")
