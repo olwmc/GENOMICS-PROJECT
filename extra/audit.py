@@ -468,7 +468,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bin-schedule", choices=["roundrobin", "longrange_upweight"], default="roundrobin")
     p.add_argument("--pairs-per-batch", type=int, default=64)
     p.add_argument("--patch-size-bp", type=int, default=100)
-    p.add_argument("--token-mode", choices=["thin", "rich"], default="thin")
     p.add_argument("--emit-pos-ids", action="store_true", default=False)
     p.add_argument("--seed", type=int, default=42)
 
@@ -517,7 +516,6 @@ def main() -> None:
         bin_schedule=args.bin_schedule,
         pairs_per_batch=args.pairs_per_batch,
         patch_size_bp=args.patch_size_bp,
-        token_mode=args.token_mode,
         emit_pos_ids=args.emit_pos_ids,
         random_seed=args.seed,
     )
@@ -536,14 +534,14 @@ def main() -> None:
         loader = DataLoader(
             dataset,
             batch_sampler=sampler,
-            collate_fn=lambda b: distance_binned_collate(b, "pair", args.token_mode),
+            collate_fn=lambda b: distance_binned_collate(b, "pair"),
         )
     else:
         loader = DataLoader(
             dataset,
             batch_size=args.pairs_per_batch,
             shuffle=False,
-            collate_fn=lambda b: distance_binned_collate(b, "triplet", args.token_mode),
+            collate_fn=lambda b: distance_binned_collate(b, "triplet"),
         )
 
     report = audit_contrastive_loader(

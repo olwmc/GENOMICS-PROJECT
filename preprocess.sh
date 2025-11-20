@@ -23,7 +23,7 @@ python dataset.py \
     --chroms chr1 \
     --bin-edges 25000,100000,400000,1000000,10000000 \
     --pos-quantile 0.7 --neg-quantile 0.3 --num-negatives 8 \
-    --min-distance-bp 25000 --pairs-per-batch 32 \
-    --patch-size-bp 100 --token-mode thin \
+    --min-distance-bp 25000 --pairs-per-batch 64 \
+    --patch-size-bp 100 \
     --hard-negative 
-  
+ 
