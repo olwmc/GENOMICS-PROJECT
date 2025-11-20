@@ -19,6 +19,7 @@ class SequenceAutoencoder(nn.Module):
 
         self.is_dna = is_dna
         self.d_model = d_model
+        self.d_bottleneck = d_model
         self.pool_size = pool_size
 
         if is_dna:
