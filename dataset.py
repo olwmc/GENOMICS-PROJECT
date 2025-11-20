@@ -55,18 +55,6 @@ def _preview_sequence(seq: torch.FloatTensor, length: int = 10) -> str:
     return "".join(bases)
 
 
-def _aggregate_epiphany(ds: h5py.Dataset, factor: int) -> np.ndarray:
-    data = np.asarray(ds)
-
-    channels, length = data.shape
-    usable = (length // factor) * factor
-    if usable == 0:
-        return np.zeros((0, channels), dtype=np.float32)
-    chunked = data[:, :usable].reshape(channels, -1, factor)
-    pooled = chunked.mean(axis=2).transpose(1, 0)
-    return pooled.astype(np.float32, copy=False)
-
-
 def _compute_valid_sequence_mask(fasta: Fasta, chrom: str, num_bins: int, bin_size: int) -> np.ndarray:
     if num_bins == 0:
         return np.zeros(0, dtype=bool)
@@ -187,7 +175,6 @@ class GenomicsContrastiveDataset(Dataset):
         bin_schedule: str = "roundrobin",
         pairs_per_batch: int = 64,
         patch_size_bp: int = 100,
-        token_mode: str = "thin",
         emit_pos_ids: bool = False,
         epiphany_bin_size: int = EPIPHANY_BIN_SIZE,
         negative_attempts: int = 32,
@@ -201,16 +188,12 @@ class GenomicsContrastiveDataset(Dataset):
             raise ValueError("mode must be 'pair' or 'triplet'")
         self.mode = mode
 
-        token_mode = token_mode.lower()
-        if token_mode not in {"thin", "rich"}:
-            raise ValueError("token_mode must be 'thin' or 'rich'")
-        self.token_mode = token_mode
         self.emit_pos_ids = bool(emit_pos_ids)
 
-        if patch_size_bp <= 0 or BIN_SIZE % patch_size_bp != 0:
+        if patch_size_bp != epiphany_bin_size:
+            raise ValueError("--patch-size-bp must equal the Epiphany bin size (100 bp) to keep 50x100bp patches")
+        if BIN_SIZE % patch_size_bp != 0:
             raise ValueError("--patch-size-bp must divide 5000 bp locus")
-        if patch_size_bp % epiphany_bin_size != 0:
-            raise ValueError("--patch-size-bp must be divisible by Epiphany bin size (100 bp)")
 
         self.patch_size_bp = int(patch_size_bp)
         self.tokens_per_locus = BIN_SIZE // self.patch_size_bp
@@ -287,8 +270,7 @@ class GenomicsContrastiveDataset(Dataset):
         # precomputed tensors per chromosome (filled in _prepare_chromosome)
         # Each entry shape by chrom:
         #   seq_tokens_all: (num_bins, tokens_per_locus, 4, patch_size_bp)
-        #   epi_tokens_all (thin): (num_bins, tokens_per_locus, epi_channels)
-        #   epi_tokens_all (rich): (num_bins, tokens_per_locus, epi_channels, epiphany_bin_size)
+        #   epi_tokens_all: (num_bins, tokens_per_locus, epi_channels)
         self.seq_tokens_all: Dict[str, torch.Tensor] = {}
         self.epi_tokens_all: Dict[str, torch.Tensor] = {}
         # Optional cached negative sampling distributions for hard-negative
@@ -320,10 +302,7 @@ class GenomicsContrastiveDataset(Dataset):
 
                 # for the given chromosome get entire epiphany data (5, 2489564)
                 epiphany_raw = np.asarray(h5[chrom], dtype=np.float32)
-                # aggregate across 50 100bp values --> values for 5kb bins (49791, 5)
-                features_mean = _aggregate_epiphany(h5[chrom], BIN_FACTOR)
 
-                # 49791
                 seq_bins = len(self._fa[chrom]) // self.bin_size
                 norm_values_full: Optional[np.ndarray] = None
                 if self.hic_norm != "NONE":
@@ -338,7 +317,7 @@ class GenomicsContrastiveDataset(Dataset):
                         continue
                     norm_values_full = _load_normalization_vector(norm_file)
 
-                max_bins = min(seq_bins, features_mean.shape[0], epiphany_raw.shape[1] // self.epi_windows_per_bin)
+                max_bins = min(seq_bins, epiphany_raw.shape[1] // self.epi_windows_per_bin)
                 # make sure we have normalisation values for each 5kb bin
                 if norm_values_full is not None:
                     if norm_values_full.size == 0:
@@ -347,9 +326,7 @@ class GenomicsContrastiveDataset(Dataset):
                 if max_bins == 0:
                     continue
                 
-                # only consider average epigenomic tracks up to the number of bins we have 
-                features_mean = features_mean[:max_bins]
-                # also trim raw 100 bp epiphany values 
+                # trim raw 100 bp epiphany values 
                 epiphany_raw = epiphany_raw[:, : max_bins * self.epi_windows_per_bin]
 
                 # mask out N's in the FASTA data
@@ -366,7 +343,7 @@ class GenomicsContrastiveDataset(Dataset):
                 # load and normalise Hi-C data for given chr 
                 # anchor: neighbor: value (nested dict)
                 contacts = _load_contacts(contact_file, self.bin_size, max_bins, norm_values)
-                chrom_info = self._prepare_chromosome(chrom, contacts, valid_mask, features_mean, epiphany_raw)
+                chrom_info = self._prepare_chromosome(chrom, contacts, valid_mask, epiphany_raw)
                 if chrom_info is None:
                     continue
                 self.chrom_data[chrom] = chrom_info
@@ -387,7 +364,6 @@ class GenomicsContrastiveDataset(Dataset):
         chrom: str,
         contacts: Dict[int, Dict[int, float]],
         valid_mask: np.ndarray,
-        features_mean: np.ndarray,
         epiphany_raw: np.ndarray,
     ) -> Optional[Dict[str, np.ndarray]]:
         valid_mask = valid_mask.astype(bool, copy=False)
@@ -493,7 +469,10 @@ class GenomicsContrastiveDataset(Dataset):
         if not chrom_keys_present:
             return None
 
-        features_norm = features_mean.copy()
+        # Flatten per-bin 100 bp epigenomic signals (50 windows * C tracks) for similarity computations
+        features_full = epiphany_raw.reshape(epiphany_raw.shape[0], -1, self.epi_windows_per_bin)  # (C, num_bins, 50)
+        features_full = features_full.transpose(1, 2, 0).reshape(-1, self.epi_windows_per_bin * epiphany_raw.shape[0])  # (num_bins, 50*C)
+        features_norm = features_full.copy()
         norms = np.linalg.norm(features_norm, axis=1, keepdims=True)
         norms[norms == 0.0] = 1.0
         features_norm /= norms
@@ -529,28 +508,20 @@ class GenomicsContrastiveDataset(Dataset):
         # Precompute epigenomic tokens
         epi = epiphany_raw  # (C, num_bins * epi_windows_per_bin)
         T = self.tokens_per_locus # 50 100bp tokens per locus/bin
-        W = self.windows_per_token # 1 if patch_size_bp = 100
         C = epi.shape[0] # num epigenomic tracks (5)
         epi_tokens_list = []
         for b in range(num_bins):
             # establish window for given bin 
             start = b * self.epi_windows_per_bin
             end = start + self.epi_windows_per_bin
-            win = epi[:, start:end].reshape(C, T, W)
-            if self.token_mode == "thin": # single epiphany value per window
-                # average 100bp epiphany signals to get a single value per 5kb
-                pooled = win.mean(axis=2, dtype=np.float32).transpose(1, 0)  # (T, C)
-                epi_tokens_list.append(torch.from_numpy(pooled.astype(np.float32, copy=False)).to(dtype=EPI_DTYPE))
-            else:
-                # "rich" consider each 100bp epiphany value
-                expanded = np.repeat(win, repeats=self.epiphany_bin_size, axis=2)  # (C, T, W*100)
-                expanded = expanded.transpose(1, 0, 2)  # (T, C, W*100)
-                epi_tokens_list.append(torch.from_numpy(expanded.astype(np.float32, copy=False)).to(dtype=EPI_DTYPE))
-        epi_tokens_all = torch.stack(epi_tokens_list, dim=0)  # (num_bins, T, C) or (num_bins, T, C, 100)
+            win = epi[:, start:end].reshape(C, T, self.windows_per_token)  # (C, 50, 1) with 100bp patches
+            pooled = win.mean(axis=2, dtype=np.float32).transpose(1, 0)  # (T, C); mean is no-op when windows_per_token==1
+            epi_tokens_list.append(torch.from_numpy(pooled.astype(np.float32, copy=False)).to(dtype=EPI_DTYPE))
+        epi_tokens_all = torch.stack(epi_tokens_list, dim=0)  # (num_bins, T, C)
         self.epi_tokens_all[chrom] = epi_tokens_all
 
         return {
-            "features": features_mean.astype(np.float32, copy=False),
+            "features": features_full.astype(np.float32, copy=False),
             "features_norm": features_norm.astype(np.float32, copy=False),
             "epiphany_raw": epiphany_raw.astype(np.float32, copy=False),
             "valid_mask": valid_mask,
@@ -679,6 +650,10 @@ class GenomicsContrastiveDataset(Dataset):
         for bin_id in self.bin_to_indices:
             others = sorted(self.bin_to_indices.keys(), key=lambda x: (abs(x - bin_id), x))
             self.bin_neighbors[bin_id] = [b for b in others if b != bin_id]
+
+        # Ensure all negative pools are finalized, including any keys without corresponding positives
+        for key, neg_entry in list(self.neg_pool.items()):
+            self.neg_pool[key] = self._finalize_pool_entry(neg_entry)
         
         # Precompute hard-negative sampling distributions
         if self.hard_negative: # weight "hard" negatives higher when sampling for negative pairs --> "hard" meaning high cosine similarity between positive pair --> forces model to be good instead of just comparing a really good pair against a really bad pair
@@ -885,12 +860,11 @@ class GenomicsContrastiveDataset(Dataset):
         return self.bin_to_indices.get(bin_id, [])
 
 
-def distance_binned_collate(batch: List[Dict[str, object]], mode: str, token_mode: str) -> Dict[str, object]:
+def distance_binned_collate(batch: List[Dict[str, object]], mode: str) -> Dict[str, object]:
     if not batch:
         raise ValueError("Empty batch")
 
     mode = mode.lower()
-    token_mode = token_mode.lower()
     if mode not in {"pair", "triplet"}:
         raise ValueError("mode must be 'pair' or 'triplet'")
 
@@ -1045,6 +1019,17 @@ def _print_batch_stats(batch: Dict[str, object], dataset: GenomicsContrastiveDat
         print(f"pos_ids shape: {tuple(batch['pos_ids'].shape)}")
 
 
+def _print_sample_shapes(sample: Dict[str, object]) -> None:
+    print("Single sample shapes:")
+    for key, value in sample.items():
+        if torch.is_tensor(value):
+            print(f"{key}: {tuple(value.shape)}")
+        elif isinstance(value, np.ndarray):
+            print(f"{key}: {value.shape} (numpy)")
+        else:
+            print(f"{key}: type={type(value).__name__}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Genomics contrastive dataset demo")
     parser.add_argument("--fasta", default='/users/jrober48/data/jroberts/2952-G/data/hg38/hg38.fa', help="Path to FASTA file")
@@ -1061,14 +1046,13 @@ def main() -> None:
     parser.add_argument("--min-distance-bp", type=int, default=25_000)
     parser.add_argument("--max-distance-bp", type=int, default=None)
     parser.add_argument("--oe-metric", choices=["oe", "logresid"], default="oe")
-    parser.add_argument("--pos-quantile", type=float, default=0.65)
-    parser.add_argument("--neg-quantile", type=float, default=0.35)
+    parser.add_argument("--pos-quantile", type=float, default=0.7)
+    parser.add_argument("--neg-quantile", type=float, default=0.3)
     parser.add_argument("--num-negatives", type=int, default=8)
     parser.add_argument("--hard-negative", action="store_true", default=False)
     parser.add_argument("--bin-schedule", choices=["roundrobin", "longrange_upweight"], default="roundrobin")
     parser.add_argument("--pairs-per-batch", type=int, default=64)
     parser.add_argument("--patch-size-bp", type=int, default=100)
-    parser.add_argument("--token-mode", choices=["thin", "rich"], default="thin")
     parser.add_argument("--emit-pos-ids", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--index", type=int, default=0, help="Dataset index to inspect (triplet mode)")
@@ -1100,13 +1084,16 @@ def main() -> None:
         bin_schedule=args.bin_schedule,
         pairs_per_batch=args.pairs_per_batch,
         patch_size_bp=args.patch_size_bp,
-        token_mode=args.token_mode,
         emit_pos_ids=args.emit_pos_ids,
         random_seed=args.seed,
     )
 
     if len(dataset) == 0:
         raise RuntimeError("Dataset contains no samples with current configuration")
+
+    sample = dataset[args.index % len(dataset)]
+    _print_sample_shapes(sample)
+    exit(1)
 
     # anchors with pos>0 per (chrom, bin)
     total_counts = defaultdict(int)
@@ -1141,7 +1128,7 @@ def main() -> None:
             bin_schedule=args.bin_schedule,
             seed=args.seed,
         )
-        loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=lambda b: distance_binned_collate(b, "pair", args.token_mode))
+        loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=lambda b: distance_binned_collate(b, "pair"))
         batch = next(iter(loader))
         _print_batch_stats(batch, dataset, mode="pair")
     else:
@@ -1149,7 +1136,7 @@ def main() -> None:
             dataset,
             batch_size=args.pairs_per_batch,
             shuffle=False,
-            collate_fn=lambda b: distance_binned_collate(b, "triplet", args.token_mode),
+            collate_fn=lambda b: distance_binned_collate(b, "triplet"),
         )
         batch = next(iter(loader))
         _print_batch_stats(batch, dataset, mode="triplet")
