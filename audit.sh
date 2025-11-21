@@ -28,6 +28,5 @@ python audit.py \
   --pos-quantile 0.7 --neg-quantile 0.3 --num-negatives 8 \
   --min-distance-bp 25000 --pairs-per-batch 64 \
   --max-batches 1 \
-  --hard-negative \
   --report-json audit.json \
   --suspects-csv suspects.csv

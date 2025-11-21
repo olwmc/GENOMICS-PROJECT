@@ -464,7 +464,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pos-quantile", type=float, default=0.65)
     p.add_argument("--neg-quantile", type=float, default=0.35)
     p.add_argument("--num-negatives", type=int, default=8)
-    p.add_argument("--hard-negative", action="store_true", default=False)
     p.add_argument("--bin-schedule", choices=["roundrobin", "longrange_upweight"], default="roundrobin")
     p.add_argument("--pairs-per-batch", type=int, default=64)
     p.add_argument("--patch-size-bp", type=int, default=100)
@@ -512,7 +511,6 @@ def main() -> None:
         pos_quantile=args.pos_quantile,
         neg_quantile=args.neg_quantile,
         num_negatives=args.num_negatives,
-        hard_negative=args.hard_negative,
         bin_schedule=args.bin_schedule,
         pairs_per_batch=args.pairs_per_batch,
         patch_size_bp=args.patch_size_bp,

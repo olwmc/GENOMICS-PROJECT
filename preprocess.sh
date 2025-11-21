@@ -20,10 +20,11 @@ source ~/genomics_env/bin/activate
 
 python dataset.py \
     --mode pair --hic-norm KR --oe-metric oe \
-    --chroms chr1 \
     --bin-edges 25000,100000,400000,1000000,10000000 \
     --pos-quantile 0.7 --neg-quantile 0.3 --num-negatives 8 \
     --min-distance-bp 25000 --pairs-per-batch 64 \
     --patch-size-bp 100 \
-    --hard-negative 
- 
+    --cache-save-dir /users/jrober48/data/jroberts/2952-G/mango_precomputed \
+
+    # --cache-load-dir /users/jrober48/data/jroberts/2952-G/mango_precomputed
+
