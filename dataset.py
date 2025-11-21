@@ -885,7 +885,7 @@ class GenomicsContrastiveDataset(Dataset):
         meta_path = cache_path / "meta.pt"
         if not meta_path.exists():
             raise FileNotFoundError(f"Missing meta.pt in cache dir: {cache_dir}")
-        meta = torch.load(meta_path, map_location="cpu")
+        meta = torch.load(meta_path, map_location="cpu", weights_only=False)
 
         self = cls.__new__(cls)
         # basic config
@@ -933,7 +933,7 @@ class GenomicsContrastiveDataset(Dataset):
 
         chroms = meta["chroms"]
         for chrom in chroms:
-            payload = torch.load(cache_path / f"{chrom}.pt", map_location="cpu")
+            payload = torch.load(cache_path / f"{chrom}.pt", map_location="cpu", weights_only=False)
             self.epi_tokens_all[chrom] = payload["epi_tokens"]
             self.chrom_data[chrom] = {
                 "valid_mask": payload["valid_mask"],
@@ -1199,8 +1199,8 @@ def main() -> None:
     if len(dataset) == 0:
         raise RuntimeError("Dataset contains no samples with current configuration")
 
-    # sample = dataset[args.index % len(dataset)]
-    # _print_sample_shapes(sample)
+    sample = dataset[args.index % len(dataset)]
+    _print_sample_shapes(sample)
 
     # # anchors with pos>0 per (chrom, bin)
     # total_counts = defaultdict(int)
