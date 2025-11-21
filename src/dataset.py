@@ -12,12 +12,13 @@ import numpy as np
 from pyfaidx import Fasta
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
+from tqdm import tqdm
 
 BIN_SIZE = 5000
 EPIPHANY_BIN_SIZE = 100
 SEQ_DTYPE = torch.float16  # change to float32 if you prefer exact previous dtype
 EPI_DTYPE = torch.float16  # change to float32 to match old behavior exactly
-PRECOMPUTE_SEQ = True      # set False if RAM is tight
+PRECOMPUTE_SEQ = False     # precompute sequence tokens (set True for faster access, False for smaller cache/footprint)
 
 if BIN_SIZE % EPIPHANY_BIN_SIZE != 0:
     raise ValueError("BIN_SIZE must be a multiple of EPIPHANY_BIN_SIZE")
@@ -171,7 +172,6 @@ class GenomicsContrastiveDataset(Dataset):
         pos_quantile: float = 0.8,
         neg_quantile: float = 0.2,
         num_negatives: int = 8,
-        hard_negative: bool = False,
         bin_schedule: str = "roundrobin",
         pairs_per_batch: int = 64,
         patch_size_bp: int = 100,
@@ -204,7 +204,6 @@ class GenomicsContrastiveDataset(Dataset):
             raise ValueError("--oe-metric must be 'oe' or 'logresid'")
         self.oe_metric = oe_metric
 
-        self.hard_negative = bool(hard_negative)
         self.num_negatives = int(num_negatives) if mode == "pair" else 1
         if self.num_negatives <= 0:
             raise ValueError("--num-negatives must be positive")
@@ -257,24 +256,22 @@ class GenomicsContrastiveDataset(Dataset):
         self._fa: Optional[Fasta] = None
         self._fa = Fasta(str(self.fasta_path), as_raw=True)
 
-        self.chrom_data: Dict[str, Dict[str, np.ndarray]] = {}
-        self.pos_pool: Dict[Tuple[str, int, int], Dict[str, np.ndarray]] = {}
-        self.neg_pool: Dict[Tuple[str, int, int], Dict[str, np.ndarray]] = {}
-        self.bin_thresholds: Dict[Tuple[str, int], Tuple[float, float]] = {}
-        self.bin_ranges: Dict[int, Tuple[int, Optional[int]]] = {}
-        self.sample_entries: List[int] = []
-        self.bin_to_indices: Dict[int, List[int]] = defaultdict(list)
-        self.bin_anchor_lookup: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
-        self.bin_neighbors: Dict[int, List[int]] = {}
+        self.chrom_data = {}
+        self.pos_pool = {}
+        self.neg_pool = {}
+        self.bin_thresholds = {}
+        self.bin_ranges = {}
+        self.sample_entries = []
+        self.bin_to_indices = defaultdict(list)
+        self.bin_anchor_lookup = defaultdict(list)
+        self.bin_neighbors = {}
 
         # precomputed tensors per chromosome (filled in _prepare_chromosome)
         # Each entry shape by chrom:
         #   seq_tokens_all: (num_bins, tokens_per_locus, 4, patch_size_bp)
         #   epi_tokens_all: (num_bins, tokens_per_locus, epi_channels)
-        self.seq_tokens_all: Dict[str, torch.Tensor] = {}
-        self.epi_tokens_all: Dict[str, torch.Tensor] = {}
-        # Optional cached negative sampling distributions for hard-negative
-        self._neg_probs: Dict[Tuple[str, int, int], np.ndarray] = {}
+        self.seq_tokens_all = {}
+        self.epi_tokens_all = {}
 
         resolution_dir = self.hic_root / f"{self.bin_size // 1000}kb_resolution_intrachromosomal"
 
@@ -290,7 +287,9 @@ class GenomicsContrastiveDataset(Dataset):
             if not target_chroms:
                 raise ValueError("No chromosomes available across all datasets")
 
-            for chrom in target_chroms:
+            total_chroms = len(target_chroms)
+            print(f"[dataset] Preparing {total_chroms} chromosome(s) ...")
+            for chrom in tqdm(target_chroms, desc="chroms", unit="chrom"):
                 contact_file = (
                     resolution_dir
                     / chrom
@@ -349,6 +348,7 @@ class GenomicsContrastiveDataset(Dataset):
                 self.chrom_data[chrom] = chrom_info
 
         self._finalize_dataset()
+
 
         if not self.sample_entries:
             raise RuntimeError(
@@ -655,26 +655,6 @@ class GenomicsContrastiveDataset(Dataset):
         for key, neg_entry in list(self.neg_pool.items()):
             self.neg_pool[key] = self._finalize_pool_entry(neg_entry)
         
-        # Precompute hard-negative sampling distributions
-        if self.hard_negative: # weight "hard" negatives higher when sampling for negative pairs --> "hard" meaning high cosine similarity between positive pair --> forces model to be good instead of just comparing a really good pair against a really bad pair
-            self._neg_probs.clear()
-            for key, neg_entry in self.neg_pool.items():
-                chrom, anchor, bin_id = key
-                if neg_entry["partners"].size == 0:
-                    continue
-                # cosine-sim weights using features_norm
-                chrom_info = self.chrom_data[chrom]
-                anchor_vec = chrom_info["features_norm"][anchor]  # (C_feat,)
-                candidates = chrom_info["features_norm"][neg_entry["partners"]]  # (N, C_feat)
-                sims = candidates @ anchor_vec
-                sims_min = float(sims.min(initial=0.0))
-                weights = sims - sims_min
-                weights = np.asarray(weights, dtype=np.float64) + 1e-6
-                total = float(weights.sum())
-                if total > 0.0:
-                    probs = weights / total
-                    self._neg_probs[key] = probs
-
     def __len__(self) -> int:
         return len(self.sample_entries)
 
@@ -732,20 +712,16 @@ class GenomicsContrastiveDataset(Dataset):
 
         neg_needed = self.num_negatives if self.mode == "pair" else 1
         replace = neg_entry["partners"].size < neg_needed
-        probs = None
-        if self.hard_negative:
-            probs = self._neg_probs.get(pos_key)
 
         neg_choices = self.rng.choice(
             neg_entry["partners"].size,
             size=neg_needed,
             replace=replace,
-            p=probs,
+            p=None,
         )
         neg_indices = neg_entry["partners"][neg_choices]
         neg_metrics = neg_entry["metrics"][neg_choices]
 
-        chrom_info = self.chrom_data[chrom]
         seq_tokens_anchor = self._sequence_tokens(chrom, anchor)
         seq_tokens_pos = self._sequence_tokens(chrom, pos_partner)
         epi_tokens_anchor = self._epigenomic_tokens(chrom, anchor)
@@ -840,6 +816,56 @@ class GenomicsContrastiveDataset(Dataset):
             self._fa.close()
             self._fa = None
 
+    def _slim_for_cache(self) -> None:
+        """Drop heavy fields that are not needed when loading from cache."""
+        for chrom, chrom_info in self.chrom_data.items():
+            chrom_info.pop("epiphany_raw", None)
+            chrom_info.pop("features", None)
+            chrom_info.pop("features_norm", None)
+
+    def save_cache_dir(self, cache_dir: Path) -> None:
+        """Save lightweight per-chromosome caches to a directory."""
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "version": 1,
+            "bin_edges": self.bin_edges,
+            "bin_size": self.bin_size,
+            "epiphany_bin_size": self.epiphany_bin_size,
+            "patch_size_bp": self.patch_size_bp,
+            "min_distance_bp": self.min_distance_bp,
+            "max_distance_bp": self.max_distance_bp,
+            "pos_quantile": self.pos_quantile,
+            "neg_quantile": self.neg_quantile,
+            "num_negatives": self.num_negatives,
+            "mode": self.mode,
+            "bin_schedule": self.bin_schedule,
+            "pairs_per_batch": self.pairs_per_batch,
+            "emit_pos_ids": self.emit_pos_ids,
+            "fasta_path": str(self.fasta_path),
+            "epiphany_path": str(self.epiphany_path),
+            "hic_root": str(self.hic_root),
+            "hic_mapq": self.hic_mapq,
+            "hic_field": self.hic_field,
+            "hic_norm": self.hic_norm,
+            "random_seed": None,
+            "chroms": sorted(self.epi_tokens_all.keys()),
+        }
+        torch.save(meta, cache_dir / "meta.pt")
+
+        for chrom in meta["chroms"]:
+            pos_subset = {k: v for k, v in self.pos_pool.items() if k[0] == chrom}
+            neg_subset = {k: v for k, v in self.neg_pool.items() if k[0] == chrom}
+            thresholds_subset = {k[1]: v for k, v in self.bin_thresholds.items() if k[0] == chrom}
+            chrom_payload = {
+                "epi_tokens": self.epi_tokens_all[chrom].cpu(),
+                "pos_pool": pos_subset,
+                "neg_pool": neg_subset,
+                "bin_thresholds": thresholds_subset,
+                "valid_mask": self.chrom_data[chrom]["valid_mask"],
+                "valid_indices": self.chrom_data[chrom]["valid_indices"],
+            }
+            torch.save(chrom_payload, cache_dir / f"{chrom}.pt")
+
     def __getstate__(self) -> Dict[str, object]:
         state = self.__dict__.copy()
         fasta = state.pop("_fa", None)
@@ -852,6 +878,80 @@ class GenomicsContrastiveDataset(Dataset):
         self.__dict__.update(state)
         if self._fa is None:
             self._fa = Fasta(str(self.fasta_path), as_raw=True)
+
+    @classmethod
+    def from_cache_dir(cls, cache_dir: str) -> "GenomicsContrastiveDataset":
+        cache_path = Path(cache_dir)
+        meta_path = cache_path / "meta.pt"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Missing meta.pt in cache dir: {cache_dir}")
+        meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+
+        self = cls.__new__(cls)
+        # basic config
+        self.bin_edges = [int(x) for x in meta["bin_edges"]]
+        self.bin_size = int(meta["bin_size"])
+        self.epiphany_bin_size = int(meta["epiphany_bin_size"])
+        self.patch_size_bp = int(meta["patch_size_bp"])
+        self.tokens_per_locus = BIN_SIZE // self.patch_size_bp
+        self.epi_windows_per_bin = self.bin_size // self.epiphany_bin_size
+        self.windows_per_token = self.patch_size_bp // self.epiphany_bin_size
+        self.mode = meta["mode"]
+        self.bin_schedule = meta["bin_schedule"]
+        self.pairs_per_batch = int(meta["pairs_per_batch"])
+        self.emit_pos_ids = bool(meta["emit_pos_ids"])
+        self.min_distance_bp = int(meta["min_distance_bp"])
+        self.max_distance_bp = None if meta["max_distance_bp"] is None else int(meta["max_distance_bp"])
+        self.pos_quantile = float(meta["pos_quantile"])
+        self.neg_quantile = float(meta["neg_quantile"])
+        self.num_negatives = int(meta["num_negatives"])
+        self.negative_attempts = 32
+        self.anchor_retry_limit = max(4, self.negative_attempts // 2)
+        self.rng = np.random.default_rng(meta.get("random_seed", None))
+
+        # paths
+        self.fasta_path = Path(meta["fasta_path"])
+        self.epiphany_path = Path(meta["epiphany_path"])
+        self.hic_root = Path(meta["hic_root"])
+        self.hic_mapq = meta["hic_mapq"]
+        self.hic_field = meta["hic_field"]
+        self.hic_norm = meta["hic_norm"]
+
+        # containers
+        self.chrom_data = {}
+        self.pos_pool = {}
+        self.neg_pool = {}
+        self.bin_thresholds = {}
+        self.sample_entries = []
+        self.bin_ranges = {}
+        self.bin_to_indices = defaultdict(list)
+        self.bin_anchor_lookup = defaultdict(list)
+        self.bin_neighbors = {}
+        self.seq_tokens_all = {}
+        self.epi_tokens_all = {}
+        self._fa = None
+
+        chroms = meta["chroms"]
+        for chrom in chroms:
+            payload = torch.load(cache_path / f"{chrom}.pt", map_location="cpu", weights_only=False)
+            self.epi_tokens_all[chrom] = payload["epi_tokens"]
+            self.chrom_data[chrom] = {
+                "valid_mask": payload["valid_mask"],
+                "valid_indices": payload["valid_indices"],
+            }
+            for key, val in payload["pos_pool"].items():
+                self.pos_pool[key] = val
+            for key, val in payload["neg_pool"].items():
+                self.neg_pool[key] = val
+            for bin_id, thresh in payload["bin_thresholds"].items():
+                self.bin_thresholds[(chrom, int(bin_id))] = thresh
+
+        # finalize schedules from cached pools
+        self._finalize_dataset()
+        for bin_id, (lower, upper) in self._compute_bin_ranges().items():
+            self.bin_ranges[bin_id] = (lower, upper)
+
+        return self
 
     def get_bin_range(self, bin_id: int) -> Tuple[int, Optional[int]]:
         return self.bin_ranges.get(bin_id, (self.bin_edges[0], None))
@@ -1049,13 +1149,14 @@ def main() -> None:
     parser.add_argument("--pos-quantile", type=float, default=0.7)
     parser.add_argument("--neg-quantile", type=float, default=0.3)
     parser.add_argument("--num-negatives", type=int, default=8)
-    parser.add_argument("--hard-negative", action="store_true", default=False)
     parser.add_argument("--bin-schedule", choices=["roundrobin", "longrange_upweight"], default="roundrobin")
     parser.add_argument("--pairs-per-batch", type=int, default=64)
     parser.add_argument("--patch-size-bp", type=int, default=100)
     parser.add_argument("--emit-pos-ids", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--index", type=int, default=0, help="Dataset index to inspect (triplet mode)")
+    parser.add_argument("--cache-load-dir", type=str, default=None, help="Optional directory to load per-chrom cached data")
+    parser.add_argument("--cache-save-dir", type=str, default=None, help="Optional directory to save per-chrom cached data")
 
     args = parser.parse_args()
 
@@ -1063,88 +1164,94 @@ def main() -> None:
     if args.bin_edges:
         bin_edges = [int(edge.strip()) for edge in args.bin_edges.split(",") if edge.strip()]
 
-    dataset = GenomicsContrastiveDataset(
-        fasta_path=args.fasta,
-        epiphany_path=args.epiphany,
-        hic_root=args.hic_root,
-        chroms=args.chroms,
-        contact_threshold=args.contact_threshold,
-        hic_mapq=args.hic_mapq,
-        hic_field=args.hic_field,
-        hic_norm=args.hic_norm,
-        mode=args.mode,
-        bin_edges=bin_edges,
-        min_distance_bp=args.min_distance_bp,
-        max_distance_bp=args.max_distance_bp,
-        oe_metric=args.oe_metric,
-        pos_quantile=args.pos_quantile,
-        neg_quantile=args.neg_quantile,
-        num_negatives=args.num_negatives,
-        hard_negative=args.hard_negative,
-        bin_schedule=args.bin_schedule,
-        pairs_per_batch=args.pairs_per_batch,
-        patch_size_bp=args.patch_size_bp,
-        emit_pos_ids=args.emit_pos_ids,
-        random_seed=args.seed,
-    )
+    dataset: GenomicsContrastiveDataset
+    if args.cache_load_dir:
+        dataset = GenomicsContrastiveDataset.from_cache_dir(args.cache_load_dir)
+    else:
+        dataset = GenomicsContrastiveDataset(
+            fasta_path=args.fasta,
+            epiphany_path=args.epiphany,
+            hic_root=args.hic_root,
+            chroms=args.chroms,
+            contact_threshold=args.contact_threshold,
+            hic_mapq=args.hic_mapq,
+            hic_field=args.hic_field,
+            hic_norm=args.hic_norm,
+            mode=args.mode,
+            bin_edges=bin_edges,
+            min_distance_bp=args.min_distance_bp,
+            max_distance_bp=args.max_distance_bp,
+            oe_metric=args.oe_metric,
+            pos_quantile=args.pos_quantile,
+            neg_quantile=args.neg_quantile,
+            num_negatives=args.num_negatives,
+            bin_schedule=args.bin_schedule,
+            pairs_per_batch=args.pairs_per_batch,
+            patch_size_bp=args.patch_size_bp,
+            emit_pos_ids=args.emit_pos_ids,
+            random_seed=args.seed,
+        )
+        if args.cache_save_dir:
+            cache_dir = Path(args.cache_save_dir)
+            dataset._slim_for_cache()
+            dataset.save_cache_dir(cache_dir)
 
     if len(dataset) == 0:
         raise RuntimeError("Dataset contains no samples with current configuration")
 
     sample = dataset[args.index % len(dataset)]
     _print_sample_shapes(sample)
-    exit(1)
 
-    # anchors with pos>0 per (chrom, bin)
-    total_counts = defaultdict(int)
-    # anchors with pos>0 but neg==0 per (chrom, bin)
-    empty_counts = defaultdict(int)
-    # anchors with pos>0 and neg>0 (usable)
-    usable_counts = defaultdict(int)
+    # # anchors with pos>0 per (chrom, bin)
+    # total_counts = defaultdict(int)
+    # # anchors with pos>0 but neg==0 per (chrom, bin)
+    # empty_counts = defaultdict(int)
+    # # anchors with pos>0 and neg>0 (usable)
+    # usable_counts = defaultdict(int)
 
-    for (chrom, anchor, bin_id), pos_entry in dataset.pos_pool.items():
-        if pos_entry["partners"].size == 0:
-            continue  # only anchors that truly have positives
-        total_counts[(chrom, bin_id)] += 1
-        neg_entry = dataset.neg_pool.get((chrom, anchor, bin_id), {"partners": np.array([], dtype=np.int64)})
-        if neg_entry["partners"].size == 0:
-            empty_counts[(chrom, bin_id)] += 1
-        else:
-            usable_counts[(chrom, bin_id)] += 1
+    # for (chrom, anchor, bin_id), pos_entry in dataset.pos_pool.items():
+    #     if pos_entry["partners"].size == 0:
+    #         continue  # only anchors that truly have positives
+    #     total_counts[(chrom, bin_id)] += 1
+    #     neg_entry = dataset.neg_pool.get((chrom, anchor, bin_id), {"partners": np.array([], dtype=np.int64)})
+    #     if neg_entry["partners"].size == 0:
+    #         empty_counts[(chrom, bin_id)] += 1
+    #     else:
+    #         usable_counts[(chrom, bin_id)] += 1
 
-    for (chrom, bin_id) in sorted(total_counts.keys()):
-        total = total_counts[(chrom, bin_id)]
-        empty = empty_counts.get((chrom, bin_id), 0)
-        usable = usable_counts.get((chrom, bin_id), 0)
-        pct_empty = 100 * empty / total if total else 0.0
-        low, high = dataset.get_bin_range(bin_id)
-        print(f"{chrom} bin {bin_id} ({low:,}–{high or 'inf'} bp): "
-            f"empty_neg={empty}/{total} ({pct_empty:.1f}%), usable={usable}")
+    # for (chrom, bin_id) in sorted(total_counts.keys()):
+    #     total = total_counts[(chrom, bin_id)]
+    #     empty = empty_counts.get((chrom, bin_id), 0)
+    #     usable = usable_counts.get((chrom, bin_id), 0)
+    #     pct_empty = 100 * empty / total if total else 0.0
+    #     low, high = dataset.get_bin_range(bin_id)
+    #     print(f"{chrom} bin {bin_id} ({low:,}–{high or 'inf'} bp): "
+    #         f"empty_neg={empty}/{total} ({pct_empty:.1f}%), usable={usable}")
 
-    if args.mode == "pair":
-        sampler = DistanceBinBatchSampler(
-            dataset=dataset,
-            pairs_per_batch=args.pairs_per_batch,
-            bin_schedule=args.bin_schedule,
-            seed=args.seed,
-        )
-        loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=lambda b: distance_binned_collate(b, "pair"))
-        batch = next(iter(loader))
-        _print_batch_stats(batch, dataset, mode="pair")
-    else:
-        loader = DataLoader(
-            dataset,
-            batch_size=args.pairs_per_batch,
-            shuffle=False,
-            collate_fn=lambda b: distance_binned_collate(b, "triplet"),
-        )
-        batch = next(iter(loader))
-        _print_batch_stats(batch, dataset, mode="triplet")
-        index = args.index % len(dataset)
-        sample = dataset[index]
-        print(
-            f"Triplet sample idx {index}: chrom={sample['chrom']} anchor={sample['anchor_index']} pos={sample['pos_index']} neg={sample['neg_index']}"
-        )
+    # if args.mode == "pair":
+    #     sampler = DistanceBinBatchSampler(
+    #         dataset=dataset,
+    #         pairs_per_batch=args.pairs_per_batch,
+    #         bin_schedule=args.bin_schedule,
+    #         seed=args.seed,
+    #     )
+    #     loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=lambda b: distance_binned_collate(b, "pair"))
+    #     batch = next(iter(loader))
+    #     _print_batch_stats(batch, dataset, mode="pair")
+    # else:
+    #     loader = DataLoader(
+    #         dataset,
+    #         batch_size=args.pairs_per_batch,
+    #         shuffle=False,
+    #         collate_fn=lambda b: distance_binned_collate(b, "triplet"),
+    #     )
+    #     batch = next(iter(loader))
+    #     _print_batch_stats(batch, dataset, mode="triplet")
+    #     index = args.index % len(dataset)
+    #     sample = dataset[index]
+    #     print(
+    #         f"Triplet sample idx {index}: chrom={sample['chrom']} anchor={sample['anchor_index']} pos={sample['pos_index']} neg={sample['neg_index']}"
+    #     )
 
 
 if __name__ == "__main__":
