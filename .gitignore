@@ -6,3 +6,4 @@ __pycache__/
 audit.json
 suspects.csv
 *.pth
+*.pt

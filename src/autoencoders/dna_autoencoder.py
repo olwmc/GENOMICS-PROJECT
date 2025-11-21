@@ -138,8 +138,8 @@ def main():
     # Configuration
     FASTA_FILE = "/oscar/scratch/omclaugh/hg38.fa"
     SEQ_LEN = 100
-    BATCH_SIZE = 64
-    EPOCHS = 25
+    BATCH_SIZE = 128
+    EPOCHS = 30
     OUTPUT_DIR = "/users/omclaugh/owm/GENOMICS-PROJECT/trained_models/"
 
     model = SequenceAutoencoder(
@@ -149,7 +149,8 @@ def main():
     )
 
     # Create dataset and dataloader
-    dataset = DNADataset(FASTA_FILE, seq_len=SEQ_LEN, max_sequences=1_000_000)
+    dataset = DNADataset(FASTA_FILE, seq_len=SEQ_LEN, max_sequences=5_000_000)
+    print("Number of test seqs:",len(dataset.test_sequences))
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")

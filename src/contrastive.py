@@ -96,7 +96,6 @@ class ContrastiveModel(nn.Module):
         return aggregated
 
     def forward(self, dna, epi):
-        """Alias for encode()"""
         return self.encode(dna, epi)
     
 
