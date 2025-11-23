@@ -32,7 +32,7 @@ import torch
 from torch.utils.data import DataLoader
 
 # Import from your dataset.py (must be in same directory or on PYTHONPATH)
-from dataset import (
+from src.dataset import (
     GenomicsContrastiveDataset,
     DistanceBinBatchSampler,
     distance_binned_collate,
