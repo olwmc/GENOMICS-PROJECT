@@ -61,6 +61,7 @@ class SequenceAutoencoder(nn.Module):
         return x[:, :target_len]
 
     def encode(self, x):
+        print(x.shape)
         x = self.input_proj(x)
         x = self.dropout(x)
         for layer in self.encoder_layers:

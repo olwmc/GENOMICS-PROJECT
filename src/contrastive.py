@@ -67,36 +67,25 @@ class ContrastiveModel(nn.Module):
         return projected
 
     def encode(self, dna, epi):
-        """
-        Encode DNA sequence with epigenomic features.
-        
-        Args:
-            dna: [B, 50, 100, 5] DNA sequences at 100bp resolution (5kb total)
-            epi: [B, 50, 5] Epigenomic tracks at 100bp resolution
-            
-        Returns:
-            [B, d_embed] Normalized embeddings
-        """
         B = dna.shape[0]
-        # Encode DNA
-        dna_embeds, _ = self.dna_autoencoder.encode(dna.reshape(B*50, -1))  # [B, 50, d_bottleneck]
-
-        dna_embeds = dna_embeds.squeeze().reshape(B, 50, -1)
         
-        # Concatenate with epigenomic features
-        encoding = torch.cat((dna_embeds.squeeze(), epi), dim=-1)  # [B, 50, d_bottleneck+5]
+        # DNA autoencoder is frozen - no need for gradients!
+        with torch.no_grad():
+            dna_embeds, _ = self.dna_autoencoder.encode(dna.reshape(B*50, -1))
         
-        # Aggregate to single embedding
-        aggregated = self._aggregate(encoding)  # [B, d_embed]
+        dna_embeds = dna_embeds.reshape(B, 50, -1)
         
-        # Normalize for contrastive learning
+        # Rest needs gradients
+        encoding = torch.cat((dna_embeds, epi), dim=-1)
+        aggregated = self._aggregate(encoding)
+        
         if self.normalize_output:
             aggregated = F.normalize(aggregated, p=2, dim=-1)
         
         return aggregated
-
-    def forward(self, dna, epi):
-        return self.encode(dna, epi)
+    
+        def forward(self, dna, epi):
+            return self.encode(dna, epi)
     
 
 if __name__ == "__main__":

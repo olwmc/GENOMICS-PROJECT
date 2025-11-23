@@ -2,10 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 
-from dataset import GenomicsContrastiveDataset, DistanceBinBatchSampler, distance_binned_collate
-from contrastive_model import ContrastiveModel
-from autoencoders.autoencoders import SequenceAutoencoder
+from src.dataset import GenomicsContrastiveDataset, DistanceBinBatchSampler, distance_binned_collate
+from src.contrastive import ContrastiveModel
+from src.autoencoders.autoencoders import SequenceAutoencoder
 
 
 class InfoNCELoss(nn.Module):
@@ -30,10 +32,31 @@ class InfoNCELoss(nn.Module):
         
         return F.cross_entropy(logits, labels)
 
+def onehot_to_tokens(onehot_seq):
+    """
+    Convert one-hot encoded sequences to token indices.
+
+    Args:
+        onehot_seq: [..., 4, seq_len] one-hot encoded DNA
+
+    Returns:
+        [..., seq_len] token indices
+    """
+    # Assuming the one-hot encoding uses dimension 4 for ACGT
+    # argmax along the one-hot dimension to get token indices
+    return torch.argmax(onehot_seq, dim=-2)  # argmax over the 4-dimension
+
 
 def main():
     # Load frozen DNA autoencoder
-    dna_autoencoder = SequenceAutoencoder.load("checkpoints/dna_autoencoder.pt")
+    dna_autoencoder = SequenceAutoencoder(
+         input_channels=5,      # vocab_size
+         is_dna=True,
+         pool_size=100
+    )
+
+    dna_autoencoder.load_state_dict(torch.load("trained_models/dna_autoencoder.pth"))
+
     dna_autoencoder.eval()
     for param in dna_autoencoder.parameters():
         param.requires_grad = False
@@ -41,25 +64,22 @@ def main():
     # Contrastive model
     model = ContrastiveModel(
         dna_autoencoder=dna_autoencoder,
-        d_embed=768,
-        aggregation_hidden_dim=1536,
+        d_embed=256, #768,
+        aggregation_hidden_dim=512,#1536,
         normalize_output=True
     ).cuda()
     
     # Dataset & DataLoader
-    dataset = GenomicsContrastiveDataset(
-        fasta_path="data/hg38.fa",
-        epiphany_path="data/GM12878_X.h5",
-        hic_root="data/hic/GM12878_primary",
-        mode="pair",
-        num_negatives=8,
-        hard_negative=True,
-        pos_quantile=0.8,
-        neg_quantile=0.2,
-        pairs_per_batch=64,
-    )
-    
+    cache_load_dir = "/oscar/scratch/omclaugh/mango_precomputed"
+    print("Loading dataset...")
+    dataset = GenomicsContrastiveDataset.from_cache_dir(cache_load_dir)
+    print("Dataset loaded!")
+
+    print("Loading sampler...")
     sampler = DistanceBinBatchSampler(dataset, pairs_per_batch=64, bin_schedule="roundrobin")
+    print("Sampler loaded!")
+
+    print("Loading dataloader...")
     loader = DataLoader(
         dataset,
         batch_sampler=sampler,
@@ -67,44 +87,50 @@ def main():
         num_workers=4,
         pin_memory=True,
     )
+    print("Dataloader loaded!")
     
     # Training setup
     criterion = InfoNCELoss(temperature=0.07)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     
-    # Train
+    scaler = GradScaler()
     model.train()
     for epoch in range(10):
         epoch_loss = 0.0
         
         for batch_idx, batch in enumerate(loader):
-            # Load data
-            seq_anchor = batch["seq_tokens_anchor"].cuda()
-            seq_pos = batch["seq_tokens_pos"].cuda()
-            seq_negs = batch["seq_tokens_negs"].cuda()  # [B, K, 50, 4, 100]
+            # Load data and convert from one-hot to tokens
+            seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"]).cuda()  # [B, 50, 100]
+            seq_pos = onehot_to_tokens(batch["seq_tokens_pos"]).cuda()
+            seq_negs_onehot = batch["seq_tokens_negs"].cuda()  # [B, K, 50, 4, 100]
+            
+            # Convert negatives from one-hot
+            B, K = seq_negs_onehot.shape[:2]
+            seq_negs = onehot_to_tokens(seq_negs_onehot)  # [B, K, 50, 100]
             
             epi_anchor = batch["epi_tokens_anchor"].cuda()
             epi_pos = batch["epi_tokens_pos"].cuda()
             epi_negs = batch["epi_tokens_negs"].cuda()  # [B, K, 50, 5]
             
-            B, K = seq_negs.shape[:2]
-            
-            # Forward pass
-            embed_anchor = model(seq_anchor, epi_anchor)  # [B, d_embed]
-            embed_pos = model(seq_pos, epi_pos)
-            
-            # Flatten negatives for batch processing
-            seq_negs_flat = seq_negs.view(B * K, 50, 4, 100)
-            epi_negs_flat = epi_negs.view(B * K, 50, 5)
-            embed_negs = model(seq_negs_flat, epi_negs_flat).view(B, K, -1)  # [B, K, d_embed]
-            
-            # Loss
-            loss = criterion(embed_anchor, embed_pos, embed_negs)
+            with autocast():
+                # Forward pass
+                embed_anchor = model(seq_anchor, epi_anchor)  # [B, d_embed]
+                embed_pos = model(seq_pos, epi_pos)
+                
+                # Flatten negatives for batch processing
+                seq_negs_flat = seq_negs.view(B * K, 50, 100)  # Note: no more 4 dimension
+                epi_negs_flat = epi_negs.view(B * K, 50, 5)
+                embed_negs = model(seq_negs_flat, epi_negs_flat).view(B, K, -1)  # [B, K, d_embed]           
+                # Loss
+                loss = criterion(embed_anchor, embed_pos, embed_negs)
             
             # Backward
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+
+            # Optimizer step with unscaling
+            scaler.step(optimizer)
+            scaler.update()
             
             epoch_loss += loss.item()
             
