@@ -84,8 +84,8 @@ class ContrastiveModel(nn.Module):
         
         return aggregated
     
-        def forward(self, dna, epi):
-            return self.encode(dna, epi)
+    def forward(self, dna, epi):
+        return self.encode(dna, epi)
     
 
 if __name__ == "__main__":

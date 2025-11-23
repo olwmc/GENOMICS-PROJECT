@@ -100,17 +100,17 @@ def main():
         
         for batch_idx, batch in enumerate(loader):
             # Load data and convert from one-hot to tokens
-            seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"]).cuda()  # [B, 50, 100]
-            seq_pos = onehot_to_tokens(batch["seq_tokens_pos"]).cuda()
-            seq_negs_onehot = batch["seq_tokens_negs"].cuda()  # [B, K, 50, 4, 100]
+            seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"])[0:1].cuda()  # [B, 50, 100]
+            seq_pos = onehot_to_tokens(batch["seq_tokens_pos"])[0:1].cuda()
+            seq_negs_onehot = batch["seq_tokens_negs"][0:1].cuda()  # [B, K, 50, 4, 100]
             
             # Convert negatives from one-hot
             B, K = seq_negs_onehot.shape[:2]
-            seq_negs = onehot_to_tokens(seq_negs_onehot)  # [B, K, 50, 100]
+            seq_negs = onehot_to_tokens(seq_negs_onehot)[0:1]  # [B, K, 50, 100]
             
-            epi_anchor = batch["epi_tokens_anchor"].cuda()
-            epi_pos = batch["epi_tokens_pos"].cuda()
-            epi_negs = batch["epi_tokens_negs"].cuda()  # [B, K, 50, 5]
+            epi_anchor = batch["epi_tokens_anchor"][0:1].cuda()
+            epi_pos = batch["epi_tokens_pos"][0:1].cuda()
+            epi_negs = batch["epi_tokens_negs"][0:1].cuda()  # [B, K, 50, 5]
             
             with autocast():
                 # Forward pass
