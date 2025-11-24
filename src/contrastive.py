@@ -36,12 +36,14 @@ class ContrastiveModel(nn.Module):
                 nn.Linear(25 * self.input_dim, aggregation_hidden_dim),
                 nn.LayerNorm(aggregation_hidden_dim),
                 nn.ReLU(),
-                nn.Linear(aggregation_hidden_dim, d_embed)
+                nn.Linear(aggregation_hidden_dim, d_embed),
+                nn.ReLU(),
+                nn.Linear(d_embed, 64)
             )
         else:
             self.aggregation_projection = nn.Linear(25 * self.input_dim, d_embed)
         
-        self.layer_norm = nn.LayerNorm(d_embed)
+        self.layer_norm = nn.LayerNorm(64)
 
     def _aggregate(self, encoding):
         """
@@ -70,8 +72,8 @@ class ContrastiveModel(nn.Module):
         B = dna.shape[0]
         
         # DNA autoencoder is frozen - no need for gradients!
-        with torch.no_grad():
-            dna_embeds, _ = self.dna_autoencoder.encode(dna.reshape(B*50, -1))
+        #with torch.no_grad():
+        dna_embeds, _ = self.dna_autoencoder.encode(dna.reshape(B*50, -1))
         
         dna_embeds = dna_embeds.reshape(B, 50, -1)
         

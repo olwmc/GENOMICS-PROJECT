@@ -9,28 +9,55 @@ from src.dataset import GenomicsContrastiveDataset, DistanceBinBatchSampler, dis
 from src.contrastive import ContrastiveModel
 from src.autoencoders.autoencoders import SequenceAutoencoder
 
-
 class InfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=0.2):
         super().__init__()
         self.temperature = temperature
-    
-    def forward(self, anchor, positive, negatives):
+
+    def forward(self, anchor, positive, explicit_negatives=None):
         """
-        Args:
-            anchor: [B, d_embed] - normalized embeddings
-            positive: [B, d_embed] - normalized embeddings
-            negatives: [B, K, d_embed] - normalized embeddings
+        anchor:     [B, D]
+        positive:   [B, D]
+        explicit_negatives: optional [B, K, D]
         """
-        # Cosine similarities (inputs already normalized)
-        pos_sim = (anchor * positive).sum(dim=-1) / self.temperature  # [B]
-        neg_sim = torch.einsum('bd,bkd->bk', anchor, negatives) / self.temperature  # [B, K]
-        
-        # Concatenate: first column is positive, rest are negatives
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)  # [B, K+1]
-        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-        
-        return F.cross_entropy(logits, labels)
+
+        B, D = anchor.shape
+
+        # 1. Normalize for cosine similarity
+        anchor = F.normalize(anchor, p=2, dim=-1)      # [B, D]
+        positive = F.normalize(positive, p=2, dim=-1)  # [B, D]
+
+        # 2. Compute all in-batch similarities
+        #    sim_matrix[i][j] = sim(anchor_i, positive_j)
+        sim_matrix = anchor @ positive.t()             # [B, B]
+        sim_matrix = sim_matrix / self.temperature
+
+        # positives are on the diagonal
+        pos_logits = torch.diag(sim_matrix)            # [B]
+
+        # 3. Combine in-batch negatives + explicit negatives
+        # Softmax will treat every off-diagonal entry as a negative
+        logits = sim_matrix                           # [B, B]
+
+        # 4. If we also have explicit negatives, append them as extra columns
+        if explicit_negatives is not None:
+            explicit_negatives = F.normalize(explicit_negatives, p=2, dim=-1)
+            # neg_logits[i][k] = sim(anchor_i, explicit_neg[i,k])
+            neg_logits = torch.einsum(
+                "bd, bkd -> bk", anchor, explicit_negatives
+            )  # [B, K]
+            neg_logits = neg_logits / self.temperature
+
+            # concatenate explicit negatives to the right
+            logits = torch.cat([logits, neg_logits], dim=1)  # [B, B+K]
+
+        # 5. Targets = index of positive for each anchor (the diagonal: i → i)
+        targets = torch.arange(B, device=anchor.device)
+
+        # 6. Cross-entropy over all logits
+        loss = F.cross_entropy(logits, targets)
+
+        return loss
 
 def onehot_to_tokens(onehot_seq):
     """
@@ -57,17 +84,20 @@ def main():
 
     dna_autoencoder.load_state_dict(torch.load("trained_models/dna_autoencoder.pth"))
 
-    dna_autoencoder.eval()
-    for param in dna_autoencoder.parameters():
-        param.requires_grad = False
+#    dna_autoencoder.eval()
+#    for param in dna_autoencoder.parameters():
+#        param.requires_grad = False
     
     # Contrastive model
     model = ContrastiveModel(
         dna_autoencoder=dna_autoencoder,
-        d_embed=256, #768,
-        aggregation_hidden_dim=512,#1536,
+        d_embed=512, #768,
+        aggregation_hidden_dim=1024,#1536,
         normalize_output=True
     ).cuda()
+
+    model = torch.compile(model)
+    print("# parameters:", sum([w.numel() for w in model.parameters()]))
     
     # Dataset & DataLoader
     cache_load_dir = "/oscar/scratch/omclaugh/mango_precomputed"
@@ -90,27 +120,28 @@ def main():
     print("Dataloader loaded!")
     
     # Training setup
-    criterion = InfoNCELoss(temperature=0.07)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    criterion = InfoNCELoss(temperature=0.2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
     
     scaler = GradScaler()
     model.train()
+    SB = 16
     for epoch in range(10):
         epoch_loss = 0.0
         
         for batch_idx, batch in enumerate(loader):
             # Load data and convert from one-hot to tokens
-            seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"])[0:1].cuda()  # [B, 50, 100]
-            seq_pos = onehot_to_tokens(batch["seq_tokens_pos"])[0:1].cuda()
-            seq_negs_onehot = batch["seq_tokens_negs"][0:1].cuda()  # [B, K, 50, 4, 100]
+            seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"])[0:SB].cuda()  # [B, 50, 100]
+            seq_pos = onehot_to_tokens(batch["seq_tokens_pos"])[0:SB].cuda()
+            seq_negs_onehot = batch["seq_tokens_negs"][0:SB].cuda()  # [B, K, 50, 4, 100]
             
             # Convert negatives from one-hot
             B, K = seq_negs_onehot.shape[:2]
-            seq_negs = onehot_to_tokens(seq_negs_onehot)[0:1]  # [B, K, 50, 100]
+            seq_negs = onehot_to_tokens(seq_negs_onehot)[0:SB]  # [B, K, 50, 100]
             
-            epi_anchor = batch["epi_tokens_anchor"][0:1].cuda()
-            epi_pos = batch["epi_tokens_pos"][0:1].cuda()
-            epi_negs = batch["epi_tokens_negs"][0:1].cuda()  # [B, K, 50, 5]
+            epi_anchor = batch["epi_tokens_anchor"][0:SB].cuda()
+            epi_pos = batch["epi_tokens_pos"][0:SB].cuda()
+            epi_negs = batch["epi_tokens_negs"][0:SB].cuda()  # [B, K, 50, 5]
             
             with autocast():
                 # Forward pass
@@ -122,7 +153,8 @@ def main():
                 epi_negs_flat = epi_negs.view(B * K, 50, 5)
                 embed_negs = model(seq_negs_flat, epi_negs_flat).view(B, K, -1)  # [B, K, d_embed]           
                 # Loss
-                loss = criterion(embed_anchor, embed_pos, embed_negs)
+                loss = criterion(embed_anchor, embed_pos, explicit_negatives=embed_negs)
+
             
             # Backward
             optimizer.zero_grad()
@@ -133,6 +165,20 @@ def main():
             scaler.update()
             
             epoch_loss += loss.item()
+
+            if batch_idx % 25 == 0:
+                with torch.no_grad():
+                    # anchor: [B, d], positive: [B, d], negatives: [B, K, d]
+                    pos_sim = (embed_anchor * embed_pos).sum(dim=-1)            # [B]
+                    neg_sim = (embed_anchor.unsqueeze(1) * embed_negs).sum(-1)  # [B, K]
+                
+                    print(
+                        f"[SIM] pos_mean={pos_sim.mean().item():.4f}, "
+                        f"neg_mean={neg_sim.mean().item():.4f}, "
+                        f"pos_min={pos_sim.min().item():.4f}, "
+                        f"neg_max={neg_sim.max().item():.4f}"
+                    )
+            
             
             if batch_idx % 100 == 0:
                 print(f"Epoch {epoch} | Batch {batch_idx}/{len(loader)} | Loss: {loss.item():.4f}")
