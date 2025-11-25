@@ -7,9 +7,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-# TODO: insert mode/result as needed
-# TODO: Import specific Dataset class (e.g., Chip2HiCDataset)
-# TODO: Import specific Model class (e.g., EmbeddingNet)
+# TODO: import model and use for evaluations
+# TODO: add integration with dataset
 
 #############################################
 # 1. Embedding → Distance → Contact Map
@@ -236,13 +235,9 @@ def evaluate_chromosome(model, dataset, chrom):
     """
     print(f"\nEvaluating {chrom}")
 
-    # TODO: Adapt logic to extract specific indices for the given chrom from your dataset
-    # idxs = [i for i, c in enumerate(dataset.chroms) if c == chrom][0]
-    # size = dataset.sizes[idxs]
-    # start = sum(dataset.sizes[:idxs])
     
-    # Mocking size for syntax check - replace with dataset logic above
-    size = 100 
+    # TODO: set size appropriately
+    # size = None
     
     emb_list = []
     gt_list = []
@@ -252,15 +247,10 @@ def evaluate_chromosome(model, dataset, chrom):
     with torch.no_grad():
         for i in tqdm(range(size), desc="Inference"):
             # TODO: Get X, y from dataset
-            # X, y = dataset[start + i]
-            # X = torch.tensor(X).unsqueeze(0).to(device)
+            # X, y = None, None
 
             # TODO: Forward pass
-            # emb = model(X) 
-            
-            # Placeholder for demonstration
-            emb = np.random.randn(1, 256) # (1 x d)
-            y_vec = np.random.randn(1, size) # GT row for this bin
+            # emb = model(X)
             
             emb_list.append(emb.squeeze())
             gt_list.append(y_vec.squeeze())
@@ -321,20 +311,15 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # evaluating final performance on chromosomes 20–22
+    # evaluating final performance
+    # TODO: change evaluation chromosomes as needed, even to smaler
     test_chroms = ["chr20", "chr21", "chr22"]
 
-    # TODO: insert mode/result as needed (Load Dataset)
+    # TODO: insert dataset and model
     # dataset = Chip2HiCDataset(mode="test", chroms=test_chroms)
-    
-    # TODO: insert mode/result as needed (Load Model)
-    # model = EmbeddingNet()
-    # model.load_state_dict(torch.load(args.model_path))
-    
-    # Mock objects for running the script without the external deps
-    dataset = None 
-    class MockModel(torch.nn.Module): pass
-    model = MockModel()
+    # model = <model>
+    dataset = None
+    model = None
 
     out = {}
 
@@ -343,22 +328,8 @@ def main():
         metrics = evaluate_chromosome(model, dataset, chrom)
         out[chrom] = metrics
 
-        # Save visualizations
-        # Paper mentions: "visualize 3D genome architecture"
-        plt.figure(figsize=(10, 5))
-        plt.subplot(1, 2, 1)
-        plt.title(f"{chrom} Prediction")
-        plt.imshow(np.log1p(metrics["pred_matrix"]), cmap="RdBu_r", vmin=0, vmax=1)
-        plt.subplot(1, 2, 2)
-        plt.title(f"{chrom} Ground Truth")
-        plt.imshow(np.log1p(metrics["true_matrix"]), cmap="RdBu_r", vmin=0, vmax=1)
-        plt.savefig(os.path.join(args.save_dir, f"{chrom}_heatmap.png"))
-        plt.close()
-
-    # Print summary
-    print("\n" + "="*30)
+    # final results
     print("FINAL EVALUATION RESULTS")
-    print("="*30)
     for chrom, m in out.items():
         print(f"\nResults for {chrom}:")
         print(f"  Pearson (Distance-Stratified): {m['pearson']:.4f}")
