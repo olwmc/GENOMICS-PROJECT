@@ -14,6 +14,7 @@ from sklearn.metrics import roc_auc_score
 # 1. Embedding → Distance → Contact Map
 #############################################
 
+
 def pairwise_distances(emb, metric="cosine"):
     """
     Compute pairwise distances between N bin embeddings.
@@ -32,18 +33,19 @@ def pairwise_distances(emb, metric="cosine"):
         sim = emb @ emb.T
         dist = 1 - sim
     else:
-        # Euclidean fallback if needed
+        # Euclidean fallback
         # $$ d(u, v) = ||u - v||_2 $$
         from scipy.spatial.distance import pdist, squareform
-        dist = squareform(pdist(emb, metric='euclidean'))
-        
+
+        dist = squareform(pdist(emb, metric="euclidean"))
+
     return dist
 
 
 def distance_to_contact(dist, mode="inv_sq"):
     """
     Convert distances to contact predictions ($P_{ij}$).
-    
+
     Modes:
     - 'inv_sq': $$ P_{ij} \propto \frac{1}{d(x_i, x_j)^2 + \epsilon} $$
     - 'exp':    $$ P_{ij} \propto e^{-d(x_i, x_j)} $$
@@ -60,12 +62,13 @@ def distance_to_contact(dist, mode="inv_sq"):
 # 2. O/E Normalization
 #############################################
 
+
 def observed_expected(mat):
     """
     Compute Observed/Expected (O/E) matrix to control for genomic distance decay.
-    
+
     $$ OE_{ij} = \frac{M_{ij}}{E(|i-j|)} $$
-    
+
     Where $E(d)$ is the average contact frequency at distance $d$.
     """
     N = mat.shape[0]
@@ -79,7 +82,7 @@ def observed_expected(mat):
         if len(diag) > 0:
             # $$ E_k = \frac{1}{N-k} \sum_{i} M_{i, i+k} $$
             expected_val = np.nanmean(diag)
-            
+
             # Fill both upper and lower triangles
             expected += np.diag(np.full(len(diag), expected_val), k=k)
             if k > 0:
@@ -93,10 +96,10 @@ def observed_expected(mat):
 # 3. Distance-stratified metrics
 #############################################
 
+
 def stratified_correlations(pred_oe, true_oe):
     """
     Compute Pearson ($r$) and Spearman ($\rho$) correlations per genomic distance.
-    This isolates the structural prediction capability from the distance decay.
     """
     N = pred_oe.shape[0]
     pearsons = []
@@ -104,16 +107,13 @@ def stratified_correlations(pred_oe, true_oe):
 
     # Iterate over diagonals (genomic distances)
     # Start at 1 to skip self-interaction, prevent noise at very long range
-    for d in range(1, min(N, 1000)): 
+    for d in range(1, min(N, 1000)):
         p_diag = np.diag(pred_oe, k=d)
         t_diag = np.diag(true_oe, k=d)
-        
+
         # Mask NaNs and Infs
         mask = np.isfinite(p_diag) & np.isfinite(t_diag)
-        
-        if mask.sum() < 10:  # Require minimum samples for correlation
-            continue
-            
+
         pearsons.append(ss.pearsonr(p_diag[mask], t_diag[mask])[0])
         spearmans.append(ss.spearmanr(p_diag[mask], t_diag[mask])[0])
 
@@ -123,12 +123,13 @@ def stratified_correlations(pred_oe, true_oe):
 #############################################
 # 4. Insulation Score (Crane et al.)
 #############################################
-# 
+#
+
 
 def compute_insulation_score(mat, window=20):
     """
     Compute insulation score to identify TAD boundaries (Crane et al., 2015).
-    
+
     Score is the log2 ratio of local contact density to a smoothed background.
     Note: If bins are 5kb, window=20 implies a 100kb window.
     """
@@ -145,10 +146,10 @@ def compute_insulation_score(mat, window=20):
     # Handle zeros/nans by replacing with small epsilon
     valid_mask = np.isfinite(ins)
     ins_valid = ins[valid_mask]
-    
+
     if len(ins_valid) == 0:
         return ins
-        
+
     smooth = ss.uniform_filter1d(ins_valid, size=window)
     ins[valid_mask] = np.log2((ins_valid + 1e-8) / (smooth + 1e-8))
 
@@ -158,9 +159,7 @@ def compute_insulation_score(mat, window=20):
 #############################################
 # 5. Loop calling (Proxy for HiCCUPS)
 #############################################
-# 
-
-[Image of chromatin loop detection]
+#
 
 
 def detect_loops_heuristic(mat, threshold=2.0):
@@ -170,21 +169,21 @@ def detect_loops_heuristic(mat, threshold=2.0):
     """
     N = mat.shape[0]
     loops = []
-    
+
     # Heuristic: Look for peaks in O/E map
     # Only look at off-diagonal elements within reasonable range
     # (e.g., < 2Mb distance, > 20kb distance)
     min_dist = 4
-    max_dist = 400 
+    max_dist = 400
 
     for i in range(0, N - min_dist):
         for j in range(i + min_dist, min(N, i + max_dist)):
-            patch = mat[i-1 : i+2, j-1 : j+2]
+            patch = mat[i - 1 : i + 2, j - 1 : j + 2]
             center = mat[i, j]
-            
+
             if not np.isfinite(center):
                 continue
-                
+
             # Check if center is strictly greater than neighbors (local max)
             if center > np.nanmax(patch) - 1e-8 and center > threshold:
                 loops.append((i, j))
@@ -195,35 +194,36 @@ def detect_loops_heuristic(mat, threshold=2.0):
 def loop_auroc(pred_matrix, true_loops_set, N):
     """
     Compute AUROC for loop detection.
-    
+
     y_true: Binary map (1 if loop in Ground Truth, 0 otherwise)
     y_score: Predicted contact values at those positions
     """
-    # Flattening N*N is memory intensive. 
+    # Flattening N*N is memory intensive.
     # We sample negatives to balance, or just use flattened if N is small (<5000).
-    
+
     y_true = np.zeros((N, N), dtype=np.int8)
     for r, c in true_loops_set:
         y_true[r, c] = 1
-        
+
     # Flatten arrays
     y_true_flat = y_true.flatten()
     y_pred_flat = pred_matrix.flatten()
-    
+
     # Handle NaNs in prediction
     mask = np.isfinite(y_pred_flat)
-    
+
     try:
         score = roc_auc_score(y_true_flat[mask], y_pred_flat[mask])
     except ValueError:
-        score = 0.5 # Edge case: only one class present
-        
+        score = 0.5  # Edge case: only one class present
+
     return score
 
 
 #############################################
 # 6. Full evaluation for a chromosome
 #############################################
+
 
 def evaluate_chromosome(model, dataset, chrom):
     """
@@ -235,10 +235,9 @@ def evaluate_chromosome(model, dataset, chrom):
     """
     print(f"\nEvaluating {chrom}")
 
-    
     # TODO: set size appropriately
     # size = None
-    
+
     emb_list = []
     gt_list = []
 
@@ -251,12 +250,12 @@ def evaluate_chromosome(model, dataset, chrom):
 
             # TODO: Forward pass
             # emb = model(X)
-            
+
             emb_list.append(emb.squeeze())
             gt_list.append(y_vec.squeeze())
 
-    emb_full = np.vstack(emb_list) # (N, d)
-    gt_full = np.vstack(gt_list)   # (N, N)
+    emb_full = np.vstack(emb_list)  # (N, d)
+    gt_full = np.vstack(gt_list)  # (N, N)
 
     # 1. Distance → Contact
     dist = pairwise_distances(emb_full, metric="cosine")
@@ -271,11 +270,11 @@ def evaluate_chromosome(model, dataset, chrom):
     print("Computing correlations...")
     pearsons, spearmans = stratified_correlations(pred_oe, gt_oe)
 
-    # 4. Insulation Scores
+    # 4. Insulation Scores (TODO: adjust window as needed)
     print("Computing insulation...")
-    pred_ins = compute_insulation_score(pred, window=20) # Adjust window based on bin size
+    pred_ins = compute_insulation_score(pred, window=20)
     gt_ins = compute_insulation_score(gt_full, window=20)
-    
+
     # Filter NaNs for correlation
     mask_ins = np.isfinite(pred_ins) & np.isfinite(gt_ins)
     if mask_ins.sum() > 0:
@@ -286,7 +285,7 @@ def evaluate_chromosome(model, dataset, chrom):
     # 5. Loops
     print("Computing loops...")
     # Use Ground Truth O/E to define "True Loops" if external bedpe not available
-    true_loops = detect_loops_heuristic(gt_oe, threshold=2.0) 
+    true_loops = detect_loops_heuristic(gt_oe, threshold=2.0)
     auroc = loop_auroc(pred_oe, true_loops, pred.shape[0])
 
     return {
@@ -302,6 +301,7 @@ def evaluate_chromosome(model, dataset, chrom):
 #############################################
 # 7. Main
 #############################################
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -336,6 +336,7 @@ def main():
         print(f"  Spearman (Distance-Stratified): {m['spearman']:.4f}")
         print(f"  Insulation Score Correlation:   {m['insulation_corr']:.4f}")
         print(f"  Loop Detection AUROC:           {m['loop_auroc']:.4f}")
+
 
 if __name__ == "__main__":
     main()
