@@ -84,17 +84,18 @@ def main():
 
     dna_autoencoder.load_state_dict(torch.load("trained_models/dna_autoencoder.pth"))
 
-#    dna_autoencoder.eval()
-#    for param in dna_autoencoder.parameters():
-#        param.requires_grad = False
+    dna_autoencoder.eval()
+    for param in dna_autoencoder.parameters():
+        param.requires_grad = False
     
     # Contrastive model
     model = ContrastiveModel(
         dna_autoencoder=dna_autoencoder,
         d_embed=512, #768,
         aggregation_hidden_dim=1024,#1536,
-        normalize_output=True
     ).cuda()
+
+    model.load_state_dict(torch.load("c_e_0.pt"))
 
     model = torch.compile(model)
     print("# parameters:", sum([w.numel() for w in model.parameters()]))
@@ -125,7 +126,7 @@ def main():
     
     scaler = GradScaler()
     model.train()
-    SB = 16
+    SB = 24
     for epoch in range(10):
         epoch_loss = 0.0
         

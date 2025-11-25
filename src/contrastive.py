@@ -12,20 +12,17 @@ class ContrastiveModel(nn.Module):
         dna_autoencoder: SequenceAutoencoder,
         d_embed: int = 768,
         aggregation_hidden_dim: int = None,
-        normalize_output: bool = True
     ):
         """
         Args:
             dna_autoencoder: Pre-trained DNA autoencoder (100bp resolution)
             d_embed: Dimension of final embedding
             aggregation_hidden_dim: If provided, adds MLP layer before final projection
-            normalize_output: Whether to L2-normalize output embeddings (recommended for contrastive learning)
         """
         super().__init__()
         
         self.dna_autoencoder = dna_autoencoder
         self.d_embed = d_embed
-        self.normalize_output = normalize_output
         
         # Input: DNA bottleneck + 5 epigenomic tracks
         self.input_dim = dna_autoencoder.d_bottleneck + 5
@@ -35,6 +32,8 @@ class ContrastiveModel(nn.Module):
             self.aggregation_projection = nn.Sequential(
                 nn.Linear(25 * self.input_dim, aggregation_hidden_dim),
                 nn.LayerNorm(aggregation_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(aggregation_hidden_dim, aggregation_hidden_dim),
                 nn.ReLU(),
                 nn.Linear(aggregation_hidden_dim, d_embed),
                 nn.ReLU(),
@@ -72,17 +71,14 @@ class ContrastiveModel(nn.Module):
         B = dna.shape[0]
         
         # DNA autoencoder is frozen - no need for gradients!
-        #with torch.no_grad():
-        dna_embeds, _ = self.dna_autoencoder.encode(dna.reshape(B*50, -1))
+        with torch.no_grad():
+            dna_embeds, _ = self.dna_autoencoder.encode(dna.reshape(B*50, -1))
         
         dna_embeds = dna_embeds.reshape(B, 50, -1)
         
         # Rest needs gradients
         encoding = torch.cat((dna_embeds, epi), dim=-1)
         aggregated = self._aggregate(encoding)
-        
-        if self.normalize_output:
-            aggregated = F.normalize(aggregated, p=2, dim=-1)
         
         return aggregated
     
