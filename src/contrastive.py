@@ -79,7 +79,7 @@ class ContrastiveModel(nn.Module):
         # Rest needs gradients
         encoding = torch.cat((dna_embeds, epi), dim=-1)
         aggregated = self._aggregate(encoding)
-        
+
         return aggregated
     
     def forward(self, dna, epi):

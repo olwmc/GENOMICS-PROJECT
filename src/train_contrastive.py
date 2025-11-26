@@ -95,8 +95,6 @@ def main():
         aggregation_hidden_dim=1024,#1536,
     ).cuda()
 
-    model.load_state_dict(torch.load("c_e_0.pt"))
-
     model = torch.compile(model)
     print("# parameters:", sum([w.numel() for w in model.parameters()]))
     
@@ -179,6 +177,14 @@ def main():
                         f"pos_min={pos_sim.min().item():.4f}, "
                         f"neg_max={neg_sim.max().item():.4f}"
                     )
+
+                    total_norm = 0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.detach().data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5
+                    print("Total grad norm:", total_norm)
             
             
             if batch_idx % 100 == 0:
