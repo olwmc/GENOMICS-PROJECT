@@ -11,10 +11,6 @@ from src.dataset import (
     distance_binned_collate,
 )
 
-##############################
-#  NEW CONTRASTIVE ENCODER  #
-##############################
-
 class ContrastiveModel(nn.Module):
     """
     Joint DNA + epigenomic encoder for 5kb loci.
@@ -126,10 +122,6 @@ class ContrastiveModel(nn.Module):
         return self.encode(dna_tokens, epi_tokens)
 
 
-#########################
-#  InfoNCE Loss (YOURS)
-#########################
-
 class InfoNCELoss(nn.Module):
     def __init__(self, temperature=0.2):
         super().__init__()
@@ -162,24 +154,12 @@ class InfoNCELoss(nn.Module):
         return F.cross_entropy(logits, targets)
 
 
-###############################
-#  One-hot → token conversion
-###############################
-
 def onehot_to_tokens(onehot):
     # onehot: [..., 4, 100]
     return torch.argmax(onehot, dim=-2)  # → [..., 100]
 
 
-###############################
-#          TRAINING
-###############################
-
 def main():
-
-    ###########################################
-    # Load Contrastive Dataset From Cache
-    ###########################################
 
     cache_load_dir = "/oscar/scratch/omclaugh/mango_precomputed"
     print("Loading dataset...")
@@ -199,10 +179,6 @@ def main():
         pin_memory=True,
     )
 
-    ###########################################
-    # Build Model
-    ###########################################
-
     model = ContrastiveModel(
         d_base=32,
         d_epi=16,
@@ -215,17 +191,9 @@ def main():
 
     print("# parameters:", sum(p.numel() for p in model.parameters()))
 
-    ###########################################
-    # Optimizer / Loss
-    ###########################################
-
     criterion = InfoNCELoss(temperature=0.2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
     scaler = GradScaler()
-
-    ###########################################
-    # Train
-    ###########################################
 
     model.train()
     SB = 64
