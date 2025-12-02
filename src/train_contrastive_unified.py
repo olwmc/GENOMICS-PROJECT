@@ -57,17 +57,18 @@ class ContrastiveModel(nn.Module):
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=ff_dim,
+            dropout=0.1,
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
 
         # 6) Projection head → final embedding for InfoNCE
         self.projection_head = nn.Sequential(
-            nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
-            nn.Dropout(0.2),
+            nn.BatchNorm1d(d_model),
             nn.ReLU(),
             nn.Linear(d_model, d_embed),
+            nn.BatchNorm1d(d_embed)
         )
 
     def _encode_dna(self, dna_tokens):
@@ -191,7 +192,14 @@ def main():
 
     print("# parameters:", sum(p.numel() for p in model.parameters()))
 
-    criterion = InfoNCELoss(temperature=0.2)
+    def variance_loss(z, eps=1e-4):
+        # z: [B, D]
+        std = torch.sqrt(z.var(dim=0) + eps)    # [D]
+        return torch.mean(F.relu(1.0 - std))    # want std >= 1
+
+    lambda_v = 0.1
+
+    criterion = InfoNCELoss(temperature=0.07)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
     scaler = GradScaler()
 
@@ -218,17 +226,20 @@ def main():
             epi_negs   = batch["epi_tokens_negs"][0:SB].cuda()  # [B,K,50,5]
 
             with autocast():
-
                 embed_anchor = model(seq_anchor, epi_anchor)  # [B, d_embed]
-                embed_pos    = model(seq_pos, epi_pos)
 
-                seq_negs_flat = seq_negs.view(Bfull * K, 50, 100)
-                epi_negs_flat = epi_negs.view(Bfull * K, 50, 5)
+                with torch.no_grad():
+                    embed_pos    = model(seq_pos, epi_pos)
 
-                embed_negs = model(seq_negs_flat, epi_negs_flat)
-                embed_negs = embed_negs.view(Bfull, K, -1)
+                    seq_negs_flat = seq_negs.view(Bfull * K, 50, 100)
+                    epi_negs_flat = epi_negs.view(Bfull * K, 50, 5)
 
-                loss = criterion(embed_anchor, embed_pos, explicit_negatives=embed_negs)
+                    embed_negs = model(seq_negs_flat, epi_negs_flat)
+                    embed_negs = embed_negs.view(Bfull, K, -1)
+
+                contrastive_loss = criterion(embed_anchor, embed_pos, explicit_negatives=embed_negs)
+                var_loss = variance_loss(embed_anchor)
+                loss = contrastive_loss + lambda_v * var_loss
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
