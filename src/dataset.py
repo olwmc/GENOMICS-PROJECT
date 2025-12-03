@@ -701,25 +701,32 @@ class GenomicsContrastiveDataset(Dataset):
         neg_entry = self.neg_pool.get(neg_key)
         if pos_entry is None or neg_entry is None:
             return None
-
+    
         if pos_entry["partners"].size == 0 or neg_entry["partners"].size == 0:
             return None
-
+    
         pos_idx = int(self.rng.integers(pos_entry["partners"].size))
         pos_partner = int(pos_entry["partners"][pos_idx])
         pos_metric = float(pos_entry["metrics"][pos_idx])
         distance_bp = int(pos_entry["distances"][pos_idx])
-
+    
+        # Filter out the positive partner from negatives
+        neg_partners = neg_entry["partners"]
+        valid_neg_mask = neg_partners != pos_partner  # Remove the positive from negatives
+        valid_neg_indices = np.where(valid_neg_mask)[0]
+    
+        if len(valid_neg_indices) < self.num_negatives:
+            return None  # Not enough valid negatives
+    
         neg_needed = self.num_negatives if self.mode == "pair" else 1
-        replace = neg_entry["partners"].size < neg_needed
-
+    
         neg_choices = self.rng.choice(
-            neg_entry["partners"].size,
+            valid_neg_indices,  # Sample from filtered indices
             size=neg_needed,
-            replace=replace,
+            replace=False,
             p=None,
         )
-        neg_indices = neg_entry["partners"][neg_choices]
+        neg_indices = neg_partners[neg_choices]
         neg_metrics = neg_entry["metrics"][neg_choices]
 
         seq_tokens_anchor = self._sequence_tokens(chrom, anchor)

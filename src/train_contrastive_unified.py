@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from tqdm import tqdm
 
 from src.dataset import (
@@ -30,6 +31,7 @@ class ContrastiveModel(nn.Module):
         n_heads=4,
         ff_dim=512,
         max_tokens=50,
+        dropout=0.1,   # Reduced from 0.2
     ):
         super().__init__()
 
@@ -57,18 +59,18 @@ class ContrastiveModel(nn.Module):
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=ff_dim,
-            dropout=0.1,
+            dropout=dropout,
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
 
         # 6) Projection head → final embedding for InfoNCE
         self.projection_head = nn.Sequential(
+            nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
-            nn.BatchNorm1d(d_model),
+            nn.Dropout(dropout),  # Reduced from 0.2
             nn.ReLU(),
             nn.Linear(d_model, d_embed),
-            nn.BatchNorm1d(d_embed)
         )
 
     def _encode_dna(self, dna_tokens):
@@ -79,14 +81,14 @@ class ContrastiveModel(nn.Module):
         B, L, S = dna_tokens.shape
         base_emb = self.dna_embedding(dna_tokens)   # [B, L, S, d_base]
         patch_emb = base_emb.mean(dim=2)            # [B, L, d_base]
-        return F.layer_norm(patch_emb, patch_emb.shape[-1:])
+        return patch_emb
 
     def _encode_epi(self, epi_tokens):
         """
         epi_tokens: [B, 50, 5]
         """
         epi = self.epi_proj(epi_tokens)             # [B, L, d_epi]
-        return F.layer_norm(epi, epi.shape[-1:])
+        return epi
 
     def encode(self, dna_tokens, epi_tokens):
         B, L, S = dna_tokens.shape       # L = 50
@@ -94,9 +96,6 @@ class ContrastiveModel(nn.Module):
     
         dna_emb = self._encode_dna(dna_tokens)   # [B, L, d_base]
         epi_emb = self._encode_epi(epi_tokens)   # [B, L, d_epi]
-    
-        dna_emb = F.layer_norm(dna_emb, dna_emb.shape[-1:])
-        epi_emb = F.layer_norm(epi_emb, epi_emb.shape[-1:])
     
         x = torch.cat([dna_emb, epi_emb], dim=-1)    # [B, L, d_base+d_epi]
         x = self.input_proj(x)                       # [B, L, d_model]
@@ -117,55 +116,67 @@ class ContrastiveModel(nn.Module):
     
         return z
 
-
-
     def forward(self, dna_tokens, epi_tokens):
         return self.encode(dna_tokens, epi_tokens)
 
-
 class InfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.2):
+    def __init__(self, temperature=1.0):
         super().__init__()
         self.temperature = temperature
 
     def forward(self, anchor, positive, explicit_negatives=None):
-        B, D = anchor.shape
-
-        anchor = F.normalize(anchor, p=2, dim=-1)
-        positive = F.normalize(positive, p=2, dim=-1)
-
-        # in-batch full cross-sim
-        sim_matrix = (anchor @ positive.t()) / self.temperature
-
-        targets = torch.arange(B, device=anchor.device)
-
-        if explicit_negatives is None:
-            return F.cross_entropy(sim_matrix, targets)
-
-        # explicit negatives: [B, K, D]
-        explicit_negatives = F.normalize(explicit_negatives, p=2, dim=-1)
         B, K, D = explicit_negatives.shape
-
-        neg_logits = torch.einsum(
-            "bd,bkd->bk", anchor, explicit_negatives
-        ) / self.temperature
-
-        logits = torch.cat([sim_matrix, neg_logits], dim=1)
-
+        
+        # Positive similarity
+        pos_sim = (anchor * positive).sum(-1, keepdim=True) / self.temperature  # [B, 1]
+        
+        # Negative similarities  
+        neg_sim = torch.einsum("bd,bkd->bk", anchor, explicit_negatives) / self.temperature  # [B, K]
+        
+        # Concatenate: [positive, neg1, neg2, ..., neg8]
+        logits = torch.cat([pos_sim, neg_sim], dim=1)  # [B, 9]
+        
+        # Target is always index 0
+        targets = torch.zeros(B, dtype=torch.long, device=anchor.device)
+        
         return F.cross_entropy(logits, targets)
-
 
 def onehot_to_tokens(onehot):
     # onehot: [..., 4, 100]
     return torch.argmax(onehot, dim=-2)  # → [..., 100]
 
+def compute_embedding_variance(model, dataset, num_samples=100):
+    """Compute variance of embeddings to check if model is learning."""
+    model.eval()
+    all_embeds = []
+    
+    with torch.no_grad():
+        for _ in range(num_samples):
+            idx = torch.randint(0, len(dataset), (1,)).item()
+            sample = dataset[idx]
+            
+            seq = onehot_to_tokens(sample["seq_tokens_anchor"].unsqueeze(0)).cuda()
+            epi = sample["epi_tokens_anchor"].unsqueeze(0).cuda()
+            
+            # FIX: Convert to float32 if needed
+            if epi.dtype == torch.float16:
+                epi = epi.float()
+            
+            embed = model(seq, epi)
+            all_embeds.append(embed)
+    
+    all_embeds = torch.cat(all_embeds, dim=0)
+    variance = all_embeds.std(dim=0).mean().item()
+    
+    model.train()
+    return variance
 
 def main():
 
-    cache_load_dir = "/oscar/scratch/omclaugh/mango_precomputed"
+    cache_load_dir = "/oscar/scratch/omclaugh/mango_precomputed_chr1"
     print("Loading dataset...")
     dataset = GenomicsContrastiveDataset.from_cache_dir(cache_load_dir)
-    print("Dataset loaded!")
+    print(f"Dataset loaded! Size: {len(dataset)}")
 
     # Sampler keeps distance bins pure
     sampler = DistanceBinBatchSampler(
@@ -174,8 +185,10 @@ def main():
 
     loader = DataLoader(
         dataset,
-        batch_sampler=sampler,
+        #batch_sampler=sampler,
+        batch_size=128,
         collate_fn=lambda b: distance_binned_collate(b, "pair"),
+        shuffle=True,
         num_workers=4,
         pin_memory=True,
     )
@@ -188,105 +201,185 @@ def main():
         n_layers=2,
         n_heads=4,
         ff_dim=1024,
+        dropout=0.0,  # Reduced from default 0.2
     ).cuda()
 
-    print("# parameters:", sum(p.numel() for p in model.parameters()))
+    print(f"# parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    def variance_loss(z, eps=1e-4):
-        # z: [B, D]
-        std = torch.sqrt(z.var(dim=0) + eps)    # [D]
-        return torch.mean(F.relu(1.0 - std))    # want std >= 1
-
-    lambda_v = 0.1
-
-    criterion = InfoNCELoss(temperature=0.07)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+    # FIX: Higher temperature, lower weight decay
+    criterion = InfoNCELoss(temperature=1.0)  # Increased from 0.2
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=3e-4, 
+        weight_decay=0.00  # Reduced from 0.1
+    )
+    
     scaler = GradScaler()
 
-    model.train()
-    SB = 64
+    # FIX: Add learning rate schedulers
+    warmup_epochs = 0.5  # 0.5 epochs = ~19k steps
+    total_epochs = 20
+    
+    warmup_steps = int(len(loader) * warmup_epochs)
+    
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.1,
+        total_iters=warmup_steps
+    )
+    
+    main_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=len(loader) * (total_epochs - warmup_epochs),
+        eta_min=1e-5
+    )
+    
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, main_scheduler],
+        milestones=[warmup_steps]
+    )
 
-    batch_idx, batch = next(enumerate(loader))
-    for epoch in range(10):
+    model.train()
+    global_step = 0
+
+    for epoch in range(total_epochs):
         epoch_loss = 0.0
+        
+        print(f"\n{'='*60}")
+        print(f"Starting Epoch {epoch}")
+        print(f"{'='*60}")
 
         for batch_idx, batch in enumerate(loader):
 
-            # Convert 1-hot → token IDs
-            seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"])[0:SB].cuda()
-            seq_pos    = onehot_to_tokens(batch["seq_tokens_pos"])[0:SB].cuda()
+            if batch_idx == 0:
+                # Check if any negative index equals the positive index
+                for b in range(min(5, len(batch["anchor_index"]))):
+                    anchor_idx = batch["anchor_index"][b].item()
+                    pos_idx = batch["pos_index"][b].item()
+                    neg_indices = batch["neg_indices"][b].cpu().numpy()
+            
+                    print(f"Sample {b}: anchor={anchor_idx}, pos={pos_idx}, negs={neg_indices}")
+            
+                    if pos_idx in neg_indices:
+                        print(f"  ⚠️ BUG STILL PRESENT: positive {pos_idx} appears in negatives!")
+                    else:
+                        print(f"  ✓ Good: positive {pos_idx} not in negatives")
+            global_step += 1
 
-            seq_negs_onehot = batch["seq_tokens_negs"][0:SB].cuda()  # [B,K,50,4,100]
+            # Convert 1-hot → token IDs
+            seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"]).cuda()
+            seq_pos    = onehot_to_tokens(batch["seq_tokens_pos"]).cuda()
+
+            seq_negs_onehot = batch["seq_tokens_negs"].cuda()  # [B,K,50,4,100]
             Bfull, K = seq_negs_onehot.shape[:2]
 
             seq_negs = onehot_to_tokens(seq_negs_onehot)  # [B,K,50,100]
 
-            epi_anchor = batch["epi_tokens_anchor"][0:SB].cuda()
-            epi_pos    = batch["epi_tokens_pos"][0:SB].cuda()
-            epi_negs   = batch["epi_tokens_negs"][0:SB].cuda()  # [B,K,50,5]
+            epi_anchor = batch["epi_tokens_anchor"].cuda()
+            epi_pos    = batch["epi_tokens_pos"].cuda()
+            epi_negs   = batch["epi_tokens_negs"].cuda()  # [B,K,50,5]
 
             with autocast():
+
                 embed_anchor = model(seq_anchor, epi_anchor)  # [B, d_embed]
+                embed_pos    = model(seq_pos, epi_pos)
 
-                with torch.no_grad():
-                    embed_pos    = model(seq_pos, epi_pos)
+                seq_negs_flat = seq_negs.view(Bfull * K, 50, 100)
+                epi_negs_flat = epi_negs.view(Bfull * K, 50, 5)
 
-                    seq_negs_flat = seq_negs.view(Bfull * K, 50, 100)
-                    epi_negs_flat = epi_negs.view(Bfull * K, 50, 5)
+                embed_negs = model(seq_negs_flat, epi_negs_flat)
+                embed_negs = embed_negs.view(Bfull, K, -1)
 
-                    embed_negs = model(seq_negs_flat, epi_negs_flat)
-                    embed_negs = embed_negs.view(Bfull, K, -1)
-
-                contrastive_loss = criterion(embed_anchor, embed_pos, explicit_negatives=embed_negs)
-                var_loss = variance_loss(embed_anchor)
-                loss = contrastive_loss + lambda_v * var_loss
+                loss = criterion(embed_anchor, embed_pos, explicit_negatives=embed_negs)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
+            
+            # FIX: Add gradient clipping
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()  # Step the LR scheduler
 
             epoch_loss += loss.item()
 
+            # Enhanced logging
             if batch_idx % 25 == 0:
                 with torch.no_grad():
                     pos_sim = (embed_anchor * embed_pos).sum(-1)
                     neg_sim = (embed_anchor.unsqueeze(1) * embed_negs).sum(-1)
+                    
+                    similarity_gap = pos_sim.mean() - neg_sim.mean()
 
                     print(
                         f"[SIM] pos_mean={pos_sim.mean().item():.4f}, "
                         f"neg_mean={neg_sim.mean().item():.4f}, "
+                        f"gap={similarity_gap.item():.4f}, "
                         f"pos_min={pos_sim.min().item():.4f}, "
                         f"neg_max={neg_sim.max().item():.4f}"
                     )
-
-                    # gradient norm
-                    total_norm = 0
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            pn = p.grad.detach().data.norm(2)
-                            total_norm += pn.item() ** 2
-                    print("Total grad norm:", total_norm ** 0.5)
+                    print(f"[GRAD] norm={grad_norm:.4f} | lr={scheduler.get_last_lr()[0]:.6f}")
+                    
+                    # Warning flags
+                    if neg_sim.max() > 0.9:
+                        print("⚠️  WARNING: neg_max > 0.9, negatives too similar to positives")
+                    if similarity_gap < 0.1:
+                        print("⚠️  WARNING: similarity gap < 0.1, model may be collapsing")
 
             if batch_idx % 100 == 0:
                 print(
-                    f"Epoch {epoch} | Batch {batch_idx}/{len(loader)} | Loss: {loss.item():.4f}"
+                    f"Epoch {epoch} | Batch {batch_idx}/{len(loader)} | "
+                    f"Loss: {loss.item():.4f} | "
+                    f"Avg Loss: {epoch_loss/(batch_idx+1):.4f}"
                 )
 
+                with torch.no_grad():
+                    neg_sim = (embed_anchor.unsqueeze(1) * embed_negs).sum(-1)  # [B, K]
+
+                    # Which negative index is 1.0?
+                    max_per_sample = neg_sim.argmax(dim=1)  # [B]
+                    print(f"Which negative is 1.0? Indices: {max_per_sample.unique().tolist()}")
+
+                    # Check if anchor and that negative are actually the same genomic locus
+                    for b in range(3):
+                        worst_idx = max_per_sample[b].item()
+                        if neg_sim[b, worst_idx] > 0.99:
+                            anchor_chr = batch["chrom"][b]
+                            anchor_pos = batch["anchor_index"][b].item()
+
+                            # Get the negative's position (you'll need to add this to your batch)
+                            print(f"Sample {b}: anchor={anchor_chr}:{anchor_pos}, similarity={neg_sim[b, worst_idx]:.4f}")
+                        
+                        # Check embedding variance every 1000 steps
+                        if global_step % 1000 == 0:
+                            embed_var = compute_embedding_variance(model, dataset)
+                            print(f"[HEALTH CHECK] Embedding variance: {embed_var:.4f}")
+                            if embed_var < 0.1:
+                                print("⚠️  WARNING: Low embedding variance, possible collapse")
+
         avg_loss = epoch_loss / len(loader)
-        print(f"==> Epoch {epoch} complete | Avg Loss: {avg_loss:.4f}\n")
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch} complete | Avg Loss: {avg_loss:.4f}")
+        print(f"{'='*60}\n")
 
         # Save checkpoint
+        checkpoint_path = f"contrastive_checkpoint_epoch{epoch}.pt"
         torch.save(
             {
                 "epoch": epoch,
+                "global_step": global_step,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "avg_loss": avg_loss,
             },
-            f"contrastive_checkpoint_epoch{epoch}.pt",
+            checkpoint_path,
         )
+        print(f"Saved checkpoint: {checkpoint_path}\n")
 
 
 if __name__ == "__main__":
     main()
-
