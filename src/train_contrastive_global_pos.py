@@ -228,24 +228,124 @@ def compute_embedding_variance(model, dataset, num_samples=100):
     return variance
 
 
+def evaluate_on_validation(model, val_loader, criterion):
+    """Evaluate model on validation set and return metrics."""
+    model.eval()
+    total_loss = 0.0
+    all_pos_sims = []
+    all_neg_sims = []
+    num_batches = 0
+    
+    print("\n" + "="*60)
+    print("VALIDATION EVALUATION")
+    print("="*60)
+    
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Validating"):
+            # Convert 1-hot → token IDs
+            seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"]).cuda()
+            seq_pos = onehot_to_tokens(batch["seq_tokens_pos"]).cuda()
+            seq_negs_onehot = batch["seq_tokens_negs"].cuda()
+            
+            Bfull, K = seq_negs_onehot.shape[:2]
+            seq_negs = onehot_to_tokens(seq_negs_onehot)
+            
+            epi_anchor = batch["epi_tokens_anchor"].cuda()
+            epi_pos = batch["epi_tokens_pos"].cuda()
+            epi_negs = batch["epi_tokens_negs"].cuda()
+            
+            pos_anchor = batch["anchor_index"].cuda()
+            pos_pos = batch["pos_index"].cuda()
+            pos_negs = batch["neg_indices"].cuda()
+            
+            # Use autocast for mixed precision (same as training)
+            with autocast():
+                # Forward pass
+                embed_anchor = model(seq_anchor, epi_anchor, pos_anchor)
+                embed_pos = model(seq_pos, epi_pos, pos_pos)
+                
+                seq_negs_flat = seq_negs.view(Bfull * K, 50, 100)
+                epi_negs_flat = epi_negs.view(Bfull * K, 50, 5)
+                pos_negs_flat = pos_negs.view(Bfull * K)
+                
+                embed_negs = model(seq_negs_flat, epi_negs_flat, pos_negs_flat)
+                embed_negs = embed_negs.view(Bfull, K, -1)
+                
+                loss = criterion(embed_anchor, embed_pos, explicit_negatives=embed_negs)
+            
+            total_loss += loss.item()
+            
+            # Compute similarities (convert back to float32 for CPU storage)
+            pos_sim = (embed_anchor * embed_pos).sum(-1).float()
+            neg_sim = (embed_anchor.unsqueeze(1) * embed_negs).sum(-1).float()
+            
+            all_pos_sims.append(pos_sim.cpu())
+            all_neg_sims.append(neg_sim.cpu())
+            num_batches += 1
+    
+    # Aggregate metrics
+    all_pos_sims = torch.cat(all_pos_sims)
+    all_neg_sims = torch.cat(all_neg_sims, dim=0)
+    
+    metrics = {
+        'loss': total_loss / num_batches,
+        'pos_sim_mean': all_pos_sims.mean().item(),
+        'neg_sim_mean': all_neg_sims.mean().item(),
+        'similarity_gap': all_pos_sims.mean().item() - all_neg_sims.mean().item(),
+        'pos_sim_min': all_pos_sims.min().item(),
+        'neg_sim_max': all_neg_sims.max().item(),
+    }
+    
+    # Print validation metrics
+    print("\nVALIDATION METRICS:")
+    print(f"  Loss: {metrics['loss']:.4f}")
+    print(f"  Positive Similarity (mean): {metrics['pos_sim_mean']:.4f}")
+    print(f"  Negative Similarity (mean): {metrics['neg_sim_mean']:.4f}")
+    print(f"  Similarity Gap: {metrics['similarity_gap']:.4f}")
+    print(f"  Positive Similarity (min): {metrics['pos_sim_min']:.4f}")
+    print(f"  Negative Similarity (max): {metrics['neg_sim_max']:.4f}")
+    
+    if metrics['similarity_gap'] > 0.20:
+        print("  ✓ Good gap! Model is discriminating well.")
+    elif metrics['neg_sim_max'] > 0.95:
+        print("  ⚠️  Some hard negatives remain highly similar")
+    
+    print("="*60 + "\n")
+    
+    model.train()
+    return metrics
+
+
 def main():
 
     cache_load_dir = "/oscar/scratch/omclaugh/mango_precomputed_chr1"
     print("Loading dataset...")
-    dataset = GenomicsContrastiveDataset.from_cache_dir(cache_load_dir)
-    print(f"Dataset loaded! Size: {len(dataset)}")
+    full_dataset = GenomicsContrastiveDataset.from_cache_dir(cache_load_dir)
+    print(f"Full dataset loaded! Size: {len(full_dataset)}")
 
-    # Sampler keeps distance bins pure
-    sampler = DistanceBinBatchSampler(
-        dataset, pairs_per_batch=64, bin_schedule="roundrobin"
+    # 90/10 train/validation split
+    train_size = int(0.9 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
     )
+    print(f"Train size: {len(train_dataset)}, Validation size: {len(val_dataset)}")
 
-    loader = DataLoader(
-        dataset,
-        #batch_sampler=sampler,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=128,
         collate_fn=lambda b: distance_binned_collate(b, "pair"),
         shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=128,
+        collate_fn=lambda b: distance_binned_collate(b, "pair"),
+        shuffle=False,
         num_workers=4,
         pin_memory=True,
     )
@@ -255,7 +355,7 @@ def main():
         d_epi=16,
         d_model=256,
         d_embed=512,
-        n_layers=2,
+        n_layers=3,
         n_heads=4,
         ff_dim=1024,
         dropout=0.0,
@@ -267,7 +367,7 @@ def main():
     criterion = InfoNCELoss(temperature=1.0)
     optimizer = torch.optim.AdamW(
         model.parameters(), 
-        lr=3e-4, 
+        lr=1e-4, 
         weight_decay=0.00
     )
     
@@ -276,7 +376,7 @@ def main():
     warmup_epochs = 0.5
     total_epochs = 50
     
-    warmup_steps = int(len(loader) * warmup_epochs)
+    warmup_steps = int(len(train_loader) * warmup_epochs)
     
     warmup_scheduler = LinearLR(
         optimizer,
@@ -286,7 +386,7 @@ def main():
     
     main_scheduler = CosineAnnealingLR(
         optimizer,
-        T_max=len(loader) * (total_epochs - warmup_epochs),
+        T_max=len(train_loader) * (total_epochs - warmup_epochs),
         eta_min=1e-5
     )
     
@@ -306,7 +406,7 @@ def main():
         print(f"Starting Epoch {epoch}")
         print(f"{'='*60}")
 
-        for batch_idx, batch in enumerate(loader):
+        for batch_idx, batch in enumerate(train_loader):
 
             if batch_idx == 0 and epoch == 0:
                 # Check if any negative index equals the positive index
@@ -398,20 +498,23 @@ def main():
 
             if batch_idx % 100 == 0:
                 print(
-                    f"Epoch {epoch} | Batch {batch_idx}/{len(loader)} | "
+                    f"Epoch {epoch} | Batch {batch_idx}/{len(train_loader)} | "
                     f"Loss: {loss.item():.4f} | "
                     f"Avg Loss: {epoch_loss/(batch_idx+1):.4f}"
                 )
 
             # Check embedding variance every 1000 steps
             if global_step % 1000 == 0:
-                embed_var = compute_embedding_variance(model, dataset)
+                embed_var = compute_embedding_variance(model, train_dataset)
                 print(f"[HEALTH CHECK] Embedding variance: {embed_var:.4f}")
 
-        avg_loss = epoch_loss / len(loader)
+        avg_loss = epoch_loss / len(train_loader)
         print(f"\n{'='*60}")
-        print(f"Epoch {epoch} complete | Avg Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch} complete | Avg Train Loss: {avg_loss:.4f}")
         print(f"{'='*60}\n")
+
+        # Evaluate on validation set
+        val_metrics = evaluate_on_validation(model, val_loader, criterion)
 
         # Save checkpoint
         checkpoint_path = f"contrastive_checkpoint_globalpos_epoch{epoch}.pt"
@@ -422,11 +525,22 @@ def main():
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
-                "avg_loss": avg_loss,
+                "avg_train_loss": avg_loss,
+                "val_metrics": val_metrics,
             },
             checkpoint_path,
         )
         print(f"Saved checkpoint: {checkpoint_path}\n")
+
+    # Final validation evaluation after all training
+    print("\n" + "="*80)
+    print("FINAL VALIDATION EVALUATION AFTER TRAINING")
+    print("="*80)
+    final_val_metrics = evaluate_on_validation(model, val_loader, criterion)
+    
+    print("\nTraining Complete!")
+    print(f"Final Validation Loss: {final_val_metrics['loss']:.4f}")
+    print(f"Final Similarity Gap: {final_val_metrics['similarity_gap']:.4f}")
 
 
 if __name__ == "__main__":
