@@ -16,44 +16,48 @@ from src.dataset import (
 
 class DNAPatchEncoder(nn.Module):
     """
-    Position-aware encoder for 100bp DNA patches.
-    Uses a small transformer to process each patch, capturing motifs and positional patterns.
+    Lightweight CNN-based encoder for 100bp DNA patches.
+    Uses multi-scale 1D convolutions to capture motifs at different lengths.
+    Much more efficient than transformer while still capturing sequence patterns.
     """
-    def __init__(self, d_base=32, n_layers=2, n_heads=2, ff_dim=128, dropout=0.1, max_seq_len=100):
+    def __init__(self, d_base=32, d_output=96, dropout=0.1, max_seq_len=100):
         super().__init__()
         
-        self.d_base = d_base
+        self.d_output = d_output
         self.max_seq_len = max_seq_len
         
         # Base embedding (ACGTN = 0,1,2,3,4)
         self.dna_embedding = nn.Embedding(5, d_base)
         
-        # Learnable positional encoding for within-patch positions
+        # Learnable positional encoding (important for position-dependent motifs)
         self.pos_encoding = nn.Parameter(torch.zeros(1, max_seq_len, d_base))
         nn.init.normal_(self.pos_encoding, std=0.02)
         
-        # Lightweight transformer for within-patch processing
-        # This captures motifs, k-mer patterns, and positional dependencies
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_base,
-            nhead=n_heads,
-            dim_feedforward=ff_dim,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,  # Pre-norm for better training
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # Multi-scale convolutional layers to capture different motif lengths
+        # Typical TF binding motifs are 6-15bp, so we use multiple kernel sizes
+        # This captures both short (3-5bp) and longer (7-9bp) patterns
+        self.conv_layers = nn.ModuleList([
+            nn.Conv1d(d_base, d_output // 4, kernel_size=3, padding=1),
+            nn.Conv1d(d_base, d_output // 4, kernel_size=5, padding=2),
+            nn.Conv1d(d_base, d_output // 4, kernel_size=7, padding=3),
+            nn.Conv1d(d_base, d_output // 4, kernel_size=9, padding=4),
+        ])
         
-        # Learnable pooling token (alternative to mean pooling)
-        self.pool_token = nn.Parameter(torch.zeros(1, 1, d_base))
-        nn.init.normal_(self.pool_token, std=0.02)
+        # Batch normalization for each conv layer
+        self.batch_norms = nn.ModuleList([
+            nn.BatchNorm1d(d_output // 4) for _ in range(4)
+        ])
+        
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_output)
         
     def forward(self, dna_tokens):
         """
         Args:
             dna_tokens: [B, L, S] where L=50 patches, S=100bp per patch
         Returns:
-            [B, L, d_base] - one embedding per patch
+            [B, L, d_output] - one embedding per patch
         """
         B, L, S = dna_tokens.shape
         assert S <= self.max_seq_len
@@ -67,18 +71,29 @@ class DNAPatchEncoder(nn.Module):
         # Add positional encoding (critical for capturing position-dependent motifs)
         x = x + self.pos_encoding[:, :S, :]
         
-        # Add pooling token at the start
-        pool_tokens = self.pool_token.expand(B * L, -1, -1)  # [B*L, 1, d_base]
-        x = torch.cat([pool_tokens, x], dim=1)  # [B*L, S+1, d_base]
+        # Transpose for Conv1d: [B*L, d_base, S]
+        x = x.transpose(1, 2)
         
-        # Process with transformer (learns motifs, k-mer patterns, etc.)
-        x = self.transformer(x)  # [B*L, S+1, d_base]
+        # Apply multi-scale convolutions in parallel
+        conv_outputs = []
+        for conv, bn in zip(self.conv_layers, self.batch_norms):
+            conv_out = conv(x)  # [B*L, d_output//4, S]
+            conv_out = bn(conv_out)
+            conv_out = self.activation(conv_out)
+            # Global max pooling over sequence length
+            # This captures the strongest activation for each filter (motif detector)
+            pooled = torch.max(conv_out, dim=2)[0]  # [B*L, d_output//4]
+            conv_outputs.append(pooled)
         
-        # Extract pooling token representation
-        patch_repr = x[:, 0, :]  # [B*L, d_base]
+        # Concatenate multi-scale features
+        patch_repr = torch.cat(conv_outputs, dim=1)  # [B*L, d_output]
         
-        # Reshape back to [B, L, d_base]
-        patch_repr = patch_repr.view(B, L, self.d_base)
+        # Apply dropout and normalization
+        patch_repr = self.dropout(patch_repr)
+        patch_repr = self.norm(patch_repr)
+        
+        # Reshape back to [B, L, d_output]
+        patch_repr = patch_repr.view(B, L, self.d_output)
         
         return patch_repr
 
@@ -101,21 +116,19 @@ class ContrastiveModel(nn.Module):
 
     def __init__(
         self,
-        d_base=32,     # per-base embedding dim
+        d_base=32,     # per-base embedding dim for CNN
         d_epi=16,      # epigenomic per-position embedding dim
         d_model=128,   # Transformer hidden size
         d_embed=512,   # final vector for InfoNCE
-        n_layers=2,
+        n_layers=3,
         n_heads=4,
         ff_dim=512,
         max_tokens=50,
         dropout=0.1,
         max_position=100000,  # Maximum genomic position (chr1 is ~50k bins)
         # DNA patch encoder parameters
-        dna_n_layers=2,
-        dna_n_heads=2,
-        dna_ff_dim=128,
-        dna_d_base=96,
+        dna_d_base=32,   # Input embedding dim for CNN
+        dna_d_output=96, # Output dim from CNN
     ):
         super().__init__()
 
@@ -124,12 +137,10 @@ class ContrastiveModel(nn.Module):
         self.max_position = max_position
 
 
-        # 1) Position-aware DNA patch encoder (NEW!)
+        # 1) Lightweight CNN-based DNA patch encoder
         self.dna_encoder = DNAPatchEncoder(
             d_base=dna_d_base,
-            n_layers=dna_n_layers,
-            n_heads=dna_n_heads,
-            ff_dim=dna_ff_dim,
+            d_output=dna_d_output,
             dropout=dropout,
             max_seq_len=100,
         )
@@ -142,7 +153,7 @@ class ContrastiveModel(nn.Module):
         )
 
         # 3) Combine DNA+epi, project to d_model
-        self.input_proj = nn.Linear(dna_d_base + d_epi, d_model)
+        self.input_proj = nn.Linear(dna_d_output + d_epi, d_model)
 
         # 4) CLS + Position token + Local positional encoding (within the 50 tokens)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -199,9 +210,9 @@ class ContrastiveModel(nn.Module):
     def _encode_dna(self, dna_tokens):
         """
         dna_tokens: [B, 50, 100]
-        Now uses position-aware transformer instead of simple averaging!
+        Now uses lightweight CNN instead of transformer!
         """
-        return self.dna_encoder(dna_tokens)  # [B, L, d_base]
+        return self.dna_encoder(dna_tokens)  # [B, L, d_output]
 
     def _encode_epi(self, epi_tokens):
         """
@@ -220,10 +231,10 @@ class ContrastiveModel(nn.Module):
         B, L, S = dna_tokens.shape       # L = 50
         assert L <= self.max_tokens
     
-        dna_emb = self._encode_dna(dna_tokens)   # [B, L, d_base] - now position-aware!
+        dna_emb = self._encode_dna(dna_tokens)   # [B, L, d_output] - CNN encoded!
         epi_emb = self._encode_epi(epi_tokens)   # [B, L, d_epi]
     
-        x = torch.cat([dna_emb, epi_emb], dim=-1)    # [B, L, d_base+d_epi]
+        x = torch.cat([dna_emb, epi_emb], dim=-1)    # [B, L, d_output+d_epi]
         x = self.input_proj(x)                       # [B, L, d_model]
     
         # Create position token with global position encoding
@@ -442,25 +453,23 @@ def main():
         dropout=0.1,
         max_position=100000,  # chr1 has ~50k bins, use 100k for safety
         # DNA patch encoder parameters
-        dna_n_layers=2,  # Small transformer within each 100bp patch
-        dna_n_heads=2,
-        dna_ff_dim=128,
-        dna_d_base=96,
+        dna_d_base=32,    # Input embedding dim for CNN
+        dna_d_output=96,  # Output dim from CNN
     ).cuda()
 
-    model = nn.DataParallel(model)
-    model = model.cuda()
+    #model = nn.DataParallel(model)
+    #model = model.cuda()
 
     print(f"# parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print("\n🧬 Position-aware DNA patch encoder enabled!")
-    print("   Each 100bp patch processed by lightweight transformer")
-    print("   Can now learn motifs, k-mers, and positional patterns!\n")
+    print("\n🧬 Lightweight CNN-based DNA patch encoder enabled!")
+    print("   Multi-scale convolutions (3,5,7,9-mer) capture motifs efficiently")
+    print("   Much lighter than transformer while still learning sequence patterns!\n")
 
     criterion = InfoNCELoss(temperature=1.0)
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=1e-4, 
-        weight_decay=0.01  # Slightly increased for more params
+        weight_decay=0.01
     )
     
     scaler = GradScaler()
@@ -580,7 +589,7 @@ def main():
                     
                     # Success indicators
                     if similarity_gap > 0.20:
-                        print("✓ Good gap! Position-aware DNA encoding helping.")
+                        print("✓ Good gap! CNN capturing motifs effectively.")
                     elif neg_sim.max() > 0.95:
                         print("⚠️  Some hard negatives remain")
 
@@ -605,7 +614,7 @@ def main():
         val_metrics = evaluate_on_validation(model, val_loader, criterion)
 
         # Save checkpoint
-        checkpoint_path = f"contrastive_checkpoint_posaware_dna_epoch{epoch}.pt"
+        checkpoint_path = f"contrastive_checkpoint_cnn_epoch{epoch}.pt"
         torch.save(
             {
                 "epoch": epoch,
