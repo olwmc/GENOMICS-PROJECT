@@ -26,14 +26,11 @@ class DNAPatchEncoder(nn.Module):
         self.d_output = d_output
         self.max_seq_len = max_seq_len
         
-        # Base embedding (ACGTN = 0,1,2,3,4)
         self.dna_embedding = nn.Embedding(5, d_base)
         
-        # Learnable positional encoding (important for position-dependent motifs)
         self.pos_encoding = nn.Parameter(torch.zeros(1, max_seq_len, d_base))
         nn.init.normal_(self.pos_encoding, std=0.02)
         
-        # Multi-scale convolutional layers to capture different motif lengths
         # Typical TF binding motifs are 6-15bp, so we use multiple kernel sizes
         # This captures both short (3-5bp) and longer (7-9bp) patterns
         self.conv_layers = nn.ModuleList([
@@ -62,37 +59,24 @@ class DNAPatchEncoder(nn.Module):
         B, L, S = dna_tokens.shape
         assert S <= self.max_seq_len
         
-        # Flatten to process all patches in parallel
         dna_flat = dna_tokens.view(B * L, S)  # [B*L, S]
-        
-        # Embed DNA bases
         x = self.dna_embedding(dna_flat)  # [B*L, S, d_base]
-        
-        # Add positional encoding (critical for capturing position-dependent motifs)
         x = x + self.pos_encoding[:, :S, :]
-        
-        # Transpose for Conv1d: [B*L, d_base, S]
         x = x.transpose(1, 2)
         
-        # Apply multi-scale convolutions in parallel
         conv_outputs = []
         for conv, bn in zip(self.conv_layers, self.batch_norms):
             conv_out = conv(x)  # [B*L, d_output//4, S]
             conv_out = bn(conv_out)
             conv_out = self.activation(conv_out)
-            # Global max pooling over sequence length
-            # This captures the strongest activation for each filter (motif detector)
             pooled = torch.max(conv_out, dim=2)[0]  # [B*L, d_output//4]
             conv_outputs.append(pooled)
         
-        # Concatenate multi-scale features
         patch_repr = torch.cat(conv_outputs, dim=1)  # [B*L, d_output]
         
-        # Apply dropout and normalization
         patch_repr = self.dropout(patch_repr)
         patch_repr = self.norm(patch_repr)
         
-        # Reshape back to [B, L, d_output]
         patch_repr = patch_repr.view(B, L, self.d_output)
         
         return patch_repr
@@ -137,7 +121,6 @@ class ContrastiveModel(nn.Module):
         self.max_position = max_position
 
 
-        # 1) Lightweight CNN-based DNA patch encoder
         self.dna_encoder = DNAPatchEncoder(
             d_base=dna_d_base,
             d_output=dna_d_output,
@@ -145,22 +128,18 @@ class ContrastiveModel(nn.Module):
             max_seq_len=100,
         )
 
-        # 2) Epigenomic projection
         self.epi_proj = nn.Sequential(
             nn.LayerNorm(5),
             nn.Linear(5, d_epi),
             nn.ReLU(),
         )
 
-        # 3) Combine DNA+epi, project to d_model
         self.input_proj = nn.Linear(dna_d_output + d_epi, d_model)
 
-        # 4) CLS + Position token + Local positional encoding (within the 50 tokens)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.pos_token = nn.Parameter(torch.zeros(1, 1, d_model))  # Dedicated position token
         self.pos_emb = nn.Parameter(torch.zeros(1, max_tokens + 2, d_model))  # +2 for CLS and POS
 
-        # 5) Transformer encoder (over 50 tokens)
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -171,7 +150,6 @@ class ContrastiveModel(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
 
-        # 6) Projection head → final embedding for InfoNCE
         self.projection_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
@@ -237,22 +215,18 @@ class ContrastiveModel(nn.Module):
         x = torch.cat([dna_emb, epi_emb], dim=-1)    # [B, L, d_output+d_epi]
         x = self.input_proj(x)                       # [B, L, d_model]
     
-        # Create position token with global position encoding
         global_pe = self._get_positional_encoding(global_position, self.d_model)  # [B, d_model]
         pos_token = self.pos_token.expand(B, 1, -1) + global_pe.unsqueeze(1)  # [B, 1, d_model]
     
         cls = self.cls_token.expand(B, 1, -1)        # [B, 1, d_model]
         
-        # Concatenate: [CLS, POS, feature_tokens]
         x = torch.cat([cls, pos_token, x], dim=1)    # [B, L+2, d_model]
     
-        # Add local positional encoding (for all tokens including CLS and POS)
         pos = self.pos_emb[:, :L+2, :]               # [1, L+2, d_model]
         x = x + pos
     
         h = self.encoder(x)                          # [B, L+2, d_model]
     
-        # cls pool
         h_cls = h[:, 0, :]                           # [B, d_model]
     
         z = self.projection_head(h_cls)              # [B, d_embed]
@@ -272,24 +246,18 @@ class InfoNCELoss(nn.Module):
     def forward(self, anchor, positive, explicit_negatives=None):
         B, K, D = explicit_negatives.shape
         
-        # Positive similarity
         pos_sim = (anchor * positive).sum(-1, keepdim=True) / self.temperature  # [B, 1]
-        
-        # Negative similarities  
         neg_sim = torch.einsum("bd,bkd->bk", anchor, explicit_negatives) / self.temperature  # [B, K]
         
-        # Concatenate: [positive, neg1, neg2, ..., neg8]
         logits = torch.cat([pos_sim, neg_sim], dim=1)  # [B, 9]
         
-        # Target is always index 0
         targets = torch.zeros(B, dtype=torch.long, device=anchor.device)
         
         return F.cross_entropy(logits, targets)
 
 
 def onehot_to_tokens(onehot):
-    # onehot: [..., 4, 100]
-    return torch.argmax(onehot, dim=-2)  # → [..., 100]
+    return torch.argmax(onehot, dim=-2) 
 
 
 def compute_embedding_variance(model, dataset, num_samples=100):
@@ -306,7 +274,7 @@ def compute_embedding_variance(model, dataset, num_samples=100):
             epi = sample["epi_tokens_anchor"].unsqueeze(0).cuda()
             pos = torch.tensor([sample["anchor_index"]], dtype=torch.long).cuda()
             
-            # FIX: Convert to float32 if needed
+            # This is weird but necessary
             if epi.dtype == torch.float16:
                 epi = epi.float()
             
@@ -350,9 +318,7 @@ def evaluate_on_validation(model, val_loader, criterion):
             pos_pos = batch["pos_index"].cuda()
             pos_negs = batch["neg_indices"].cuda()
             
-            # Use autocast for mixed precision (same as training)
             with autocast():
-                # Forward pass
                 embed_anchor = model(seq_anchor, epi_anchor, pos_anchor)
                 embed_pos = model(seq_pos, epi_pos, pos_pos)
                 
@@ -367,7 +333,6 @@ def evaluate_on_validation(model, val_loader, criterion):
             
             total_loss += loss.item()
             
-            # Compute similarities (convert back to float32 for CPU storage)
             pos_sim = (embed_anchor * embed_pos).sum(-1).float()
             neg_sim = (embed_anchor.unsqueeze(1) * embed_negs).sum(-1).float()
             
@@ -375,7 +340,6 @@ def evaluate_on_validation(model, val_loader, criterion):
             all_neg_sims.append(neg_sim.cpu())
             num_batches += 1
     
-    # Aggregate metrics
     all_pos_sims = torch.cat(all_pos_sims)
     all_neg_sims = torch.cat(all_neg_sims, dim=0)
     
@@ -388,7 +352,6 @@ def evaluate_on_validation(model, val_loader, criterion):
         'neg_sim_max': all_neg_sims.max().item(),
     }
     
-    # Print validation metrics
     print("\nVALIDATION METRICS:")
     print(f"  Loss: {metrics['loss']:.4f}")
     print(f"  Positive Similarity (mean): {metrics['pos_sim_mean']:.4f}")
@@ -448,7 +411,7 @@ def main():
         d_model=256,
         d_embed=512,
         n_layers=3,
-        n_heads=4,
+        n_heads=8,
         ff_dim=1024,
         dropout=0.1,
         max_position=100000,  # chr1 has ~50k bins, use 100k for safety
@@ -457,13 +420,7 @@ def main():
         dna_d_output=96,  # Output dim from CNN
     ).cuda()
 
-    #model = nn.DataParallel(model)
-    #model = model.cuda()
-
     print(f"# parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print("\n🧬 Lightweight CNN-based DNA patch encoder enabled!")
-    print("   Multi-scale convolutions (3,5,7,9-mer) capture motifs efficiently")
-    print("   Much lighter than transformer while still learning sequence patterns!\n")
 
     criterion = InfoNCELoss(temperature=1.0)
     optimizer = torch.optim.AdamW(
@@ -519,13 +476,12 @@ def main():
                     print(f"Sample {b}: anchor={anchor_idx}, pos={pos_idx}, negs={neg_indices}")
             
                     if pos_idx in neg_indices:
-                        print(f"  ⚠️ BUG STILL PRESENT: positive {pos_idx} appears in negatives!")
+                        print(f"  BUG STILL PRESENT: positive {pos_idx} appears in negatives!")
                     else:
                         print(f"  ✓ Good: positive {pos_idx} not in negatives")
             
             global_step += 1
 
-            # Convert 1-hot → token IDs
             seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"]).cuda()
             seq_pos    = onehot_to_tokens(batch["seq_tokens_pos"]).cuda()
 
@@ -538,17 +494,14 @@ def main():
             epi_pos    = batch["epi_tokens_pos"].cuda()
             epi_negs   = batch["epi_tokens_negs"].cuda()  # [B,K,50,5]
             
-            # NEW: Get global positions
             pos_anchor = batch["anchor_index"].cuda()      # [B]
             pos_pos = batch["pos_index"].cuda()            # [B]
             pos_negs = batch["neg_indices"].cuda()         # [B, K]
 
             with autocast():
-                # Pass global positions to model
                 embed_anchor = model(seq_anchor, epi_anchor, pos_anchor)
                 embed_pos    = model(seq_pos, epi_pos, pos_pos)
 
-                # Flatten negatives for encoding
                 seq_negs_flat = seq_negs.view(Bfull * K, 50, 100)
                 epi_negs_flat = epi_negs.view(Bfull * K, 50, 5)
                 pos_negs_flat = pos_negs.view(Bfull * K)  # Flatten positions too
@@ -570,7 +523,6 @@ def main():
 
             epoch_loss += loss.item()
 
-            # Enhanced logging
             if batch_idx % 25 == 0:
                 with torch.no_grad():
                     pos_sim = (embed_anchor * embed_pos).sum(-1)

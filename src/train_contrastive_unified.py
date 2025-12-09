@@ -36,25 +36,16 @@ class ContrastiveModel(nn.Module):
         super().__init__()
 
         self.max_tokens = max_tokens
-
-        # 1) DNA base embedding
         self.dna_embedding = nn.Embedding(5, d_base)
-
-        # 2) Epigenomic projection
         self.epi_proj = nn.Sequential(
             nn.LayerNorm(5),
             nn.Linear(5, d_epi),
             nn.ReLU(),
         )
-
-        # 3) Combine DNA+epi, project to d_model
         self.input_proj = nn.Linear(d_base + d_epi, d_model)
-
-        # 4) CLS + Positional encoding
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.pos_emb = nn.Parameter(torch.zeros(1, max_tokens + 1, d_model))
 
-        # 5) Transformer encoder (over 50 tokens)
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -64,7 +55,6 @@ class ContrastiveModel(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
 
-        # 6) Projection head → final embedding for InfoNCE
         self.projection_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
@@ -127,23 +117,15 @@ class InfoNCELoss(nn.Module):
     def forward(self, anchor, positive, explicit_negatives=None):
         B, K, D = explicit_negatives.shape
         
-        # Positive similarity
         pos_sim = (anchor * positive).sum(-1, keepdim=True) / self.temperature  # [B, 1]
-        
-        # Negative similarities  
         neg_sim = torch.einsum("bd,bkd->bk", anchor, explicit_negatives) / self.temperature  # [B, K]
-        
-        # Concatenate: [positive, neg1, neg2, ..., neg8]
         logits = torch.cat([pos_sim, neg_sim], dim=1)  # [B, 9]
-        
-        # Target is always index 0
         targets = torch.zeros(B, dtype=torch.long, device=anchor.device)
         
         return F.cross_entropy(logits, targets)
 
 def onehot_to_tokens(onehot):
-    # onehot: [..., 4, 100]
-    return torch.argmax(onehot, dim=-2)  # → [..., 100]
+    return torch.argmax(onehot, dim=-2)  
 
 def compute_embedding_variance(model, dataset, num_samples=100):
     """Compute variance of embeddings to check if model is learning."""
@@ -158,7 +140,6 @@ def compute_embedding_variance(model, dataset, num_samples=100):
             seq = onehot_to_tokens(sample["seq_tokens_anchor"].unsqueeze(0)).cuda()
             epi = sample["epi_tokens_anchor"].unsqueeze(0).cuda()
             
-            # FIX: Convert to float32 if needed
             if epi.dtype == torch.float16:
                 epi = epi.float()
             
@@ -178,7 +159,6 @@ def main():
     dataset = GenomicsContrastiveDataset.from_cache_dir(cache_load_dir)
     print(f"Dataset loaded! Size: {len(dataset)}")
 
-    # Sampler keeps distance bins pure
     sampler = DistanceBinBatchSampler(
         dataset, pairs_per_batch=64, bin_schedule="roundrobin"
     )
@@ -201,23 +181,21 @@ def main():
         n_layers=2,
         n_heads=4,
         ff_dim=1024,
-        dropout=0.0,  # Reduced from default 0.2
+        dropout=0.0,  
     ).cuda()
 
     print(f"# parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # FIX: Higher temperature, lower weight decay
-    criterion = InfoNCELoss(temperature=1.0)  # Increased from 0.2
+    criterion = InfoNCELoss(temperature=1.0)  
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=3e-4, 
-        weight_decay=0.00  # Reduced from 0.1
+        weight_decay=0.00  
     )
     
     scaler = GradScaler()
 
-    # FIX: Add learning rate schedulers
-    warmup_epochs = 0.5  # 0.5 epochs = ~19k steps
+    warmup_epochs = 0.5 
     total_epochs = 20
     
     warmup_steps = int(len(loader) * warmup_epochs)
@@ -253,7 +231,6 @@ def main():
         for batch_idx, batch in enumerate(loader):
 
             if batch_idx == 0:
-                # Check if any negative index equals the positive index
                 for b in range(min(5, len(batch["anchor_index"]))):
                     anchor_idx = batch["anchor_index"][b].item()
                     pos_idx = batch["pos_index"][b].item()
@@ -262,7 +239,7 @@ def main():
                     print(f"Sample {b}: anchor={anchor_idx}, pos={pos_idx}, negs={neg_indices}")
             
                     if pos_idx in neg_indices:
-                        print(f"  ⚠️ BUG STILL PRESENT: positive {pos_idx} appears in negatives!")
+                        print(f"  BUG STILL PRESENT: positive {pos_idx} appears in negatives!")
                     else:
                         print(f"  ✓ Good: positive {pos_idx} not in negatives")
             global_step += 1
@@ -296,17 +273,15 @@ def main():
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             
-            # FIX: Add gradient clipping
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()  # Step the LR scheduler
+            scheduler.step()
 
             epoch_loss += loss.item()
 
-            # Enhanced logging
             if batch_idx % 25 == 0:
                 with torch.no_grad():
                     pos_sim = (embed_anchor * embed_pos).sum(-1)
@@ -339,21 +314,17 @@ def main():
                 with torch.no_grad():
                     neg_sim = (embed_anchor.unsqueeze(1) * embed_negs).sum(-1)  # [B, K]
 
-                    # Which negative index is 1.0?
                     max_per_sample = neg_sim.argmax(dim=1)  # [B]
                     print(f"Which negative is 1.0? Indices: {max_per_sample.unique().tolist()}")
 
-                    # Check if anchor and that negative are actually the same genomic locus
                     for b in range(3):
                         worst_idx = max_per_sample[b].item()
                         if neg_sim[b, worst_idx] > 0.99:
                             anchor_chr = batch["chrom"][b]
                             anchor_pos = batch["anchor_index"][b].item()
 
-                            # Get the negative's position (you'll need to add this to your batch)
                             print(f"Sample {b}: anchor={anchor_chr}:{anchor_pos}, similarity={neg_sim[b, worst_idx]:.4f}")
                         
-                        # Check embedding variance every 1000 steps
                         if global_step % 1000 == 0:
                             embed_var = compute_embedding_variance(model, dataset)
                             print(f"[HEALTH CHECK] Embedding variance: {embed_var:.4f}")
@@ -365,7 +336,6 @@ def main():
         print(f"Epoch {epoch} complete | Avg Loss: {avg_loss:.4f}")
         print(f"{'='*60}\n")
 
-        # Save checkpoint
         checkpoint_path = f"contrastive_checkpoint_epoch{epoch}.pt"
         torch.save(
             {

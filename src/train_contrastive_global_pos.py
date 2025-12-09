@@ -48,25 +48,20 @@ class ContrastiveModel(nn.Module):
         self.d_model = d_model
         self.max_position = max_position
 
-        # 1) DNA base embedding
         self.dna_embedding = nn.Embedding(5, d_base)
 
-        # 2) Epigenomic projection
         self.epi_proj = nn.Sequential(
             nn.LayerNorm(5),
             nn.Linear(5, d_epi),
             nn.ReLU(),
         )
 
-        # 3) Combine DNA+epi, project to d_model
         self.input_proj = nn.Linear(d_base + d_epi, d_model)
 
-        # 4) CLS + Position token + Local positional encoding (within the 50 tokens)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.pos_token = nn.Parameter(torch.zeros(1, 1, d_model))  # Dedicated position token
         self.pos_emb = nn.Parameter(torch.zeros(1, max_tokens + 2, d_model))  # +2 for CLS and POS
 
-        # 5) Transformer encoder (over 50 tokens)
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -76,7 +71,6 @@ class ContrastiveModel(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
 
-        # 6) Projection head → final embedding for InfoNCE
         self.projection_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
@@ -197,7 +191,7 @@ class InfoNCELoss(nn.Module):
 
 def onehot_to_tokens(onehot):
     # onehot: [..., 4, 100]
-    return torch.argmax(onehot, dim=-2)  # → [..., 100]
+    return torch.argmax(onehot, dim=-2)
 
 
 def compute_embedding_variance(model, dataset, num_samples=100):
@@ -214,7 +208,6 @@ def compute_embedding_variance(model, dataset, num_samples=100):
             epi = sample["epi_tokens_anchor"].unsqueeze(0).cuda()
             pos = torch.tensor([sample["anchor_index"]], dtype=torch.long).cuda()
             
-            # FIX: Convert to float32 if needed
             if epi.dtype == torch.float16:
                 epi = epi.float()
             
@@ -242,7 +235,7 @@ def evaluate_on_validation(model, val_loader, criterion):
     
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validating"):
-            # Convert 1-hot → token IDs
+            # Convert 1-hot to token IDs
             seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"]).cuda()
             seq_pos = onehot_to_tokens(batch["seq_tokens_pos"]).cuda()
             seq_negs_onehot = batch["seq_tokens_negs"].cuda()
@@ -258,9 +251,7 @@ def evaluate_on_validation(model, val_loader, criterion):
             pos_pos = batch["pos_index"].cuda()
             pos_negs = batch["neg_indices"].cuda()
             
-            # Use autocast for mixed precision (same as training)
             with autocast():
-                # Forward pass
                 embed_anchor = model(seq_anchor, epi_anchor, pos_anchor)
                 embed_pos = model(seq_pos, epi_pos, pos_pos)
                 
@@ -275,7 +266,6 @@ def evaluate_on_validation(model, val_loader, criterion):
             
             total_loss += loss.item()
             
-            # Compute similarities (convert back to float32 for CPU storage)
             pos_sim = (embed_anchor * embed_pos).sum(-1).float()
             neg_sim = (embed_anchor.unsqueeze(1) * embed_negs).sum(-1).float()
             
@@ -418,17 +408,12 @@ def main():
                     print(f"Sample {b}: anchor={anchor_idx}, pos={pos_idx}, negs={neg_indices}")
             
                     if pos_idx in neg_indices:
-                        print(f"  ⚠️ BUG STILL PRESENT: positive {pos_idx} appears in negatives!")
+                        print(f"  BUG STILL PRESENT: positive {pos_idx} appears in negatives!")
                     else:
                         print(f"  ✓ Good: positive {pos_idx} not in negatives")
-                
-                print("\n🌍 Global position encoding enabled!")
-                print(f"   Architecture: [CLS | POS | 50 feature tokens]")
-                print(f"   Position token carries spatial info, features stay pure\n")
             
             global_step += 1
 
-            # Convert 1-hot → token IDs
             seq_anchor = onehot_to_tokens(batch["seq_tokens_anchor"]).cuda()
             seq_pos    = onehot_to_tokens(batch["seq_tokens_pos"]).cuda()
 
@@ -441,7 +426,6 @@ def main():
             epi_pos    = batch["epi_tokens_pos"].cuda()
             epi_negs   = batch["epi_tokens_negs"].cuda()  # [B,K,50,5]
             
-            # NEW: Get global positions
             pos_anchor = batch["anchor_index"].cuda()      # [B]
             pos_pos = batch["pos_index"].cuda()            # [B]
             pos_negs = batch["neg_indices"].cuda()         # [B, K]

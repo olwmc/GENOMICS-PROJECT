@@ -23,38 +23,27 @@ class InfoNCELoss(nn.Module):
 
         B, D = anchor.shape
 
-        # 1. Normalize for cosine similarity
         anchor = F.normalize(anchor, p=2, dim=-1)      # [B, D]
         positive = F.normalize(positive, p=2, dim=-1)  # [B, D]
 
-        # 2. Compute all in-batch similarities
-        #    sim_matrix[i][j] = sim(anchor_i, positive_j)
         sim_matrix = anchor @ positive.t()             # [B, B]
         sim_matrix = sim_matrix / self.temperature
 
-        # positives are on the diagonal
         pos_logits = torch.diag(sim_matrix)            # [B]
 
-        # 3. Combine in-batch negatives + explicit negatives
-        # Softmax will treat every off-diagonal entry as a negative
         logits = sim_matrix                           # [B, B]
 
-        # 4. If we also have explicit negatives, append them as extra columns
         if explicit_negatives is not None:
             explicit_negatives = F.normalize(explicit_negatives, p=2, dim=-1)
-            # neg_logits[i][k] = sim(anchor_i, explicit_neg[i,k])
             neg_logits = torch.einsum(
                 "bd, bkd -> bk", anchor, explicit_negatives
             )  # [B, K]
             neg_logits = neg_logits / self.temperature
 
-            # concatenate explicit negatives to the right
             logits = torch.cat([logits, neg_logits], dim=1)  # [B, B+K]
 
-        # 5. Targets = index of positive for each anchor (the diagonal: i → i)
         targets = torch.arange(B, device=anchor.device)
 
-        # 6. Cross-entropy over all logits
         loss = F.cross_entropy(logits, targets)
 
         return loss
@@ -69,13 +58,10 @@ def onehot_to_tokens(onehot_seq):
     Returns:
         [..., seq_len] token indices
     """
-    # Assuming the one-hot encoding uses dimension 4 for ACGT
-    # argmax along the one-hot dimension to get token indices
-    return torch.argmax(onehot_seq, dim=-2)  # argmax over the 4-dimension
+    return torch.argmax(onehot_seq, dim=-2)
 
 
 def main():
-    # Load frozen DNA autoencoder
     dna_autoencoder = SequenceAutoencoder(
          input_channels=5,      # vocab_size
          is_dna=True,

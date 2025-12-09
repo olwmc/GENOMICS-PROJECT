@@ -24,10 +24,8 @@ class ContrastiveModel(nn.Module):
         self.dna_autoencoder = dna_autoencoder
         self.d_embed = d_embed
         
-        # Input: DNA bottleneck + 5 epigenomic tracks
         self.input_dim = dna_autoencoder.d_bottleneck + 5
         
-        # Aggregation: 50 bins → 25 bins → single embedding
         if aggregation_hidden_dim is not None:
             self.aggregation_projection = nn.Sequential(
                 nn.Linear(25 * self.input_dim, aggregation_hidden_dim),
@@ -57,7 +55,7 @@ class ContrastiveModel(nn.Module):
         B, n_bins, d = encoding.shape
         assert n_bins == 50 and d == self.input_dim
         
-        # Merge adjacent pairs: 50 → 25 bins
+        # Merge adjacent pairs: 50 -> 25 bins
         reduced = encoding.view(B, 25, 2, self.input_dim).mean(dim=2)  # [B, 25, d]
         
         # Flatten and project
@@ -70,13 +68,11 @@ class ContrastiveModel(nn.Module):
     def encode(self, dna, epi):
         B = dna.shape[0]
         
-        # DNA autoencoder is frozen - no need for gradients!
         with torch.no_grad():
             dna_embeds, _ = self.dna_autoencoder.encode(dna.reshape(B*50, -1))
         
         dna_embeds = dna_embeds.reshape(B, 50, -1)
         
-        # Rest needs gradients
         encoding = torch.cat((dna_embeds, epi), dim=-1)
         aggregated = self._aggregate(encoding)
 

@@ -1,5 +1,3 @@
-# src/contrastive_new.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,23 +27,18 @@ class ContrastiveModel(nn.Module):
 
         self.max_tokens = max_tokens
 
-        # 1) DNA: embed per-base, then pool within each 100bp patch
         self.dna_embedding = nn.Embedding(5, d_base)  # A,C,G,T,N → d_base
 
-        # 2) Epigenomic tracks: small MLP per position
         self.epi_proj = nn.Sequential(
             nn.LayerNorm(5),
             nn.Linear(5, d_epi),
             nn.ReLU(),
         )
 
-        # 3) Combine DNA+epi at each of 50 positions, then project to d_model
         self.input_proj = nn.Linear(d_base + d_epi, d_model)
 
-        # 4) Positional encoding for 50 tokens (5kb / 100bp = 50)
         self.pos_emb = nn.Parameter(torch.zeros(1, max_tokens, d_model))
 
-        # 5) Transformer encoder over sequence of 50 fused tokens
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -54,7 +47,6 @@ class ContrastiveModel(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        # 6) Projection head → final embedding
         self.projection_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
@@ -70,7 +62,7 @@ class ContrastiveModel(nn.Module):
         B, L, S = dna_tokens.shape  # L should be 50, S = 100
         # [B, L, S, d_base]
         base_emb = self.dna_embedding(dna_tokens)  
-        # average over 100bp within each patch → [B, L, d_base]
+        # average over 100bp within each patch -> [B, L, d_base]
         patch_emb = base_emb.mean(dim=2)
         return patch_emb
 
@@ -96,7 +88,7 @@ class ContrastiveModel(nn.Module):
         dna_emb = F.layer_norm(dna_emb, dna_emb.shape[-1:])
         epi_emb = F.layer_norm(epi_emb, epi_emb.shape[-1:])
 
-        # Fuse: [B, L, d_base+d_epi] → [B, L, d_model]
+        # Fuse
         x = torch.cat([dna_emb, epi_emb], dim=-1)
         x = self.input_proj(x)
 
