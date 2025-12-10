@@ -4,7 +4,6 @@ import scipy.sparse as sp
 from tqdm import tqdm
 from dataset import GenomicsContrastiveDataset
 
-# --- Configuration ---
 CACHE_DIR = None
 CHROM = "chr1"  # TODO: change as desired
 WINDOW_SIZE = 500
@@ -12,10 +11,6 @@ NUM_BATCHES = 100  # TODO: change as desired
 
 
 def dict_to_dense(contact_dict, start, end):
-    """
-    Efficiently rebuilds a dense numpy matrix from the dataset's sparse dictionary
-    just for the specific window we are looking at.
-    """
     size = end - start
     mat = np.zeros((size, size), dtype=np.float32)
     for i in range(start, end):
@@ -31,7 +26,7 @@ def calculate_structural_score(matrix):
     # data cleaning: remove 0 / nan
     valid_mask = np.isfinite(matrix) & (matrix > 0)
     if valid_mask.sum() / matrix.size < 0.5:
-        return 0  # Too sparse
+        return 0
 
     # log transform
     log_mat = np.log1p(matrix)
@@ -67,13 +62,13 @@ def main():
     best_score = -1
     best_data = None
 
-    step = WINDOW_SIZE // 2  # gives overlap
+    step = WINDOW_SIZE // 2
 
     for i in tqdm(range(NUM_BATCHES)):
         start = i * step
         end = start + WINDOW_SIZE
 
-        # Stop if we go out of bounds
+        # stop if we go out of bounds
         if end > len(seq_tensor):
             break
 
@@ -103,7 +98,7 @@ def main():
         outfile = "illustrative_example.npz"
         np.savez(outfile, **best_data)
         print(f"output saved to {outfile}")
-        print(f"Coordinates: {best_data['coords']}")
+        print(f"coordinates: {best_data['coords']}")
     else:
         print("No valid data found in the first 100 batches.")
 
